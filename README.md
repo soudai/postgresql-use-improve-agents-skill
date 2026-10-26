@@ -1,0 +1,109 @@
+# PostgreSQL Performance Diagnostics Agent Skill
+
+PostgreSQL 18・19の統計情報、実行計画、ログを使い、改善するSQLやテーブルを根拠付きで絞り込むAgent Skillです。[全体計画Issue #1](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/1)の診断を、共通の収集基盤と用途別の手順にまとめています。
+
+## 内容
+
+- `skills/postgres-performance-diagnostics/SKILL.md`: エージェントの入口と調査の分岐。
+- `references/`: SQL・索引、I/O・メモリ、ロック、保守・レプリケーションの診断手順。
+- `sql/`: 読み取り用の収集SQLと、その依存ビューを記録するマニフェスト。
+- `scripts/`: スナップショット収集、区間差分、実行計画、JSONログの解析。
+
+統計から出せるのは調査候補です。Seq Scan、低ヒット率、高い実行回数だけで異常とは判定せず、実行計画やアプリの情報で原因を確認します。DDL・設定変更・セッション終了を自動適用するツールではありません。
+
+## 利用要件と対応版
+
+- Python 3.10以降。解析スクリプトは標準ライブラリで動作します。
+- 実DBからの収集には`psql`と接続情報が必要です。PostgreSQL 18以降のクライアントを推奨します。
+- 基本統計は標準機能を使用し、SQL単位の累積統計には`pg_stat_statements`を使用します。未導入・権限不足の収集項目は、その制限を報告します。
+- 対象はPostgreSQL 18・19です。2026-10-26に確認した[公式19ドキュメント](https://www.postgresql.org/docs/19/index.html)はRC1です。実サーバの版、ビュー・列、拡張版を検出し、19正式版公開後にも検証してください。
+
+## スキルを利用する
+
+利用するエージェントのスキル探索ディレクトリへ、`skills/postgres-performance-diagnostics`をフォルダごと配置します。配置先はエージェントごとに確認してください。以下はCodex用のコピー例です。既存の同名スキルがある場合は、上書きせず差分を確認してください。
+
+```powershell
+$skillSource = Join-Path (Get-Location) 'skills/postgres-performance-diagnostics'
+$skillTarget = Join-Path $env:USERPROFILE '.codex/skills/postgres-performance-diagnostics'
+if (Test-Path -LiteralPath $skillTarget) { throw '同名スキルが既にあります。差分を確認してください。' }
+New-Item -ItemType Directory -Path (Split-Path $skillTarget -Parent) -Force | Out-Null
+Copy-Item -LiteralPath $skillSource -Destination $skillTarget -Recurse
+```
+
+呼び出し例:
+
+```text
+$postgres-performance-diagnostics を使い、before.json と after.json から
+改善候補を抽出してください。対象APIのp95目標は200msです。
+実行計画が不足する候補は、必要な追加情報と取得手順を示してください。
+```
+
+## 統計を収集・比較する
+
+接続先は`PGSERVICE`または`PGHOST`・`PGPORT`・`PGDATABASE`・`PGUSER`等、認証はlibpqのパスワードファイルなどで設定します。パスワードをコマンドラインやリポジトリへ記載しないでください。
+
+```powershell
+$env:PGSERVICE = 'performance-observer'
+python skills/postgres-performance-diagnostics/scripts/collect.py --instance-id prod-primary --output snapshots/before.json
+```
+
+代表的な負荷が流れた後、同じ接続先・同じ識別子で再度収集します。
+
+```powershell
+python skills/postgres-performance-diagnostics/scripts/collect.py --instance-id prod-primary --output snapshots/after.json
+python skills/postgres-performance-diagnostics/scripts/analyze.py snapshots/before.json snapshots/after.json --format markdown --output reports/interval.md --top 20
+```
+
+`--instance-id`は接続先を識別する安定した名前にし、別クラスタに同じ名前を使わないでください。統計のreset、再起動、ロール切替、設定変更があった区間は、その影響を確認して新たな基準点を取得します。
+
+SQL本文は収集時の`--include-query-text`指定時だけ含めます。本文を含めない場合も、relation名、ユーザー名、application_name等は機密情報になり得ます。出力は権限を限定した場所に保存してください。`snapshots/`と`reports/`はGitの対象外です。
+
+取得項目、拡張導入、権限、タイムアウト、収集上限については[収集手順](skills/postgres-performance-diagnostics/references/collection.md)を参照してください。スクリプトの正確な引数は各`--help`でも確認できます。
+
+## 計画とログを解析する
+
+```powershell
+python skills/postgres-performance-diagnostics/scripts/analyze_plan.py plan.json --format json --output reports/plan.json
+python skills/postgres-performance-diagnostics/scripts/analyze_logs.py postgresql.jsonlog --format json --output reports/logs.json
+```
+
+`plan.json`はJSON形式のEXPLAIN出力です。ログ解析はPostgreSQLの`jsonlog`を対象とします。`--format`の既定はMarkdownです。式やSQL・ログ本文まで出力する場合は`--include-details`を指定します。EXPLAIN ANALYZEはSQLを実際に実行するため、まず取得済みの計画を使い、追加実行が必要なときは対象・負荷・副作用を評価します。詳しくは[クエリ診断](skills/postgres-performance-diagnostics/references/query-tuning.md)を参照してください。
+
+自動解析は候補抽出を補助します。計画解析は全ての最適化を網羅せず、ログのtemp・duration等のメッセージ解析は英語形式を対象とします。deadlockはSQLSTATEでも判別します。未分類ログや部分採取がある場合は、解析結果の制限事項を確認してください。
+
+## 診断とIssueの対応
+
+| Issue | 診断 |
+| --- | --- |
+| [#2](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/2) | 共通収集・拡張導入・版の差分 |
+| [#3](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/3) | スロークエリ・非効率なスキャン |
+| [#4](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/4) | キャッシュ・ブロックヒット率・I/O |
+| [#5](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/5) | temp spill・ソート・ハッシュ |
+| [#6](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/6) | JOIN・ORDER BY・LIMITと索引 |
+| [#7](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/7) | 大量行取得・高頻度SQL・N+1 |
+| [#8](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/8) | ロングトランザクション・ロック・deadlock |
+| [#9](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/9) | 見積もり誤差・統計不足・計画退行 |
+| [#10](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/10) | autovacuum・肥大化・freeze・HOT |
+| [#11](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/11) | WAL・checkpoint・レプリケーション |
+| [#12](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/12) | 接続・CPU・メモリ・並列実行 |
+
+## 検証
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+ユニットテストには本番DBの認証情報は不要です。実サーバでの検証では、PostgreSQLと拡張の正確な版、成功した収集項目、スキップした項目を記録してください。性能改善の評価手順と、診断レポートの形式は[検証手順](skills/postgres-performance-diagnostics/references/validation.md)にあります。
+
+Dockerによる統合テストは、使用する公式イメージをローカルに取得してから実行します。
+
+```powershell
+docker pull postgres:18-bookworm
+python tests/integration.py --image postgres:18-bookworm
+docker pull postgres:19rc1-bookworm
+python tests/integration.py --image postgres:19rc1-bookworm
+```
+
+テストは新しい使い捨てコンテナを作り、合成データと`pg_stat_statements`を使います。ホストのポート・データディレクトリは公開／マウントせず、コンテナのネットワークを無効化します。テスト自身が作ったコンテナだけを識別して終了時に削除します。スクリプトはイメージを自動取得しません。
+
+2026-10-26の検証では、ユニットテスト55件、スキル形式の検証、PostgreSQL 18.6／19rc1の統合テストが成功しました。合成データでの収集・解析・誤比較の防止を確認した結果であり、本番負荷での性能改善や、全Issueの完了条件を満たしたという意味ではありません。実レプリケーション構成、実際のdeadlock、managed cloud環境は未検証です。[検証範囲](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。

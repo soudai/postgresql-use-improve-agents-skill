@@ -1,0 +1,73 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Gather",
+      "Plan Rows": 1000,
+      "Actual Rows": 200000,
+      "Actual Loops": 1,
+      "Workers Planned": 2,
+      "Workers Launched": 1,
+      "Shared Hit Blocks": 200,
+      "Shared Read Blocks": 100,
+      "Plans": [
+        {
+          "Node Type": "Sort",
+          "Plan Rows": 1000,
+          "Actual Rows": 1000,
+          "Actual Loops": 2,
+          "Sort Method": "external merge",
+          "Sort Space Type": "Disk",
+          "Sort Space Used": 2048,
+          "Temp Read Blocks": 256,
+          "Shared Hit Blocks": 200,
+          "Shared Read Blocks": 100,
+          "Sort Key": ["private.customer_token"],
+          "Workers": [{"Worker Number": 0, "Actual Rows": 500, "Actual Loops": 1, "Sort Space Type": "Disk", "Sort Space Used": 1024}],
+          "Plans": [
+            {
+              "Node Type": "Hash Join",
+              "Plan Rows": 1000,
+              "Actual Rows": 1000,
+              "Actual Loops": 2,
+              "Hash Cond": "orders.private_token = customer.private_token",
+              "Plans": [
+                {
+                  "Node Type": "Seq Scan",
+                  "Schema": "public",
+                  "Relation Name": "orders",
+                  "Plan Rows": 5,
+                  "Actual Rows": 5,
+                  "Actual Loops": 2,
+                  "Rows Removed by Filter": 99995,
+                  "Filter": "customer_token = 'TOP_SECRET_PARAMETER'"
+                },
+                {
+                  "Node Type": "Hash",
+                  "Plan Rows": 500,
+                  "Actual Rows": 500,
+                  "Actual Loops": 2,
+                  "Hash Batches": 8,
+                  "Peak Memory Usage": 1024,
+                  "Plans": [
+                    {
+                      "Node Type": "Index Only Scan",
+                      "Relation Name": "customers",
+                      "Index Name": "customers_id_idx",
+                      "Plan Rows": 500,
+                      "Actual Rows": 500,
+                      "Actual Loops": 2,
+                      "Heap Fetches": 400
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "Planning Time": 1.25,
+    "Execution Time": 935.2,
+    "JIT": {"Functions": 8, "Timing": {"Generation": 2.4, "Total": 7.2}, "Options": {"Inlining": false}}
+  }
+]

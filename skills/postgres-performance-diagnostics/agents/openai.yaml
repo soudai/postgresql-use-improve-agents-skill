@@ -1,0 +1,4 @@
+interface:
+  display_name: "PostgreSQL性能診断"
+  short_description: "統計・実行計画・ログからPostgreSQLの改善候補と検証手順を整理する"
+  default_prompt: "$postgres-performance-diagnostics を使い、PostgreSQLの統計・ログ・実行計画から改善候補を根拠付きで抽出してください。"

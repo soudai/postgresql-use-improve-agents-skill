@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+snapshots/
+reports/
+*.jsonlog
+.env
+.env.*
+pgpass
+.pgpass
+pg_service.conf
+.test-output/
+.test-deps/
