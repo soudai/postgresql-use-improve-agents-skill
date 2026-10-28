@@ -118,6 +118,13 @@ def validate_pair(before, after):
         raise ValueError("snapshots are reversed, overlapping, or have no observation interval")
 
 
+def created_after(value, boundary):
+    try:
+        return value is not None and timestamp(value) > timestamp(boundary)
+    except (TypeError, ValueError):
+        return False
+
+
 def changed_marker(old, new, name):
     return old.get(name) != new.get(name) if name in old or name in new else False
 
@@ -174,6 +181,7 @@ def section_deltas(before, after, name, warnings):
         new_keys.add(k)
     output = []
     excluded = {}
+    new_in_interval = 0
     setting_a, setting_b = settings(before), settings(after)
     for current in b["rows"]:
         k = key(current)
@@ -181,6 +189,10 @@ def section_deltas(before, after, name, warnings):
         if any(value is None for value in k) or k in duplicates:
             reason = "missing_or_duplicate_identity"
         previous = old.get(k)
+        if previous is None and reason is None and name == "pgss" and created_after(current.get("stats_since"), a["collected_at"]):
+            # Created inside the interval (PG17+ stats_since): every counted call is in the window, so start from zero.
+            previous = dict({field: 0 for field in counters if field in current}, stats_since=current["stats_since"])
+            new_in_interval += 1
         if previous is None:
             reason = reason or "no_baseline"
         if reason is None:
@@ -223,6 +235,11 @@ def section_deltas(before, after, name, warnings):
             # Logical buffer accesses track CPU/memory-bandwidth cost even when every access is a hit.
             result["shared_blks_accessed"] = (delta["shared_blks_hit"] + delta["shared_blks_read"]
                                               if {"shared_blks_hit", "shared_blks_read"} <= delta.keys() else None)
+            # Share of execution spent waiting on reads; low means a low hit ratio is not what users wait for.
+            read_time = sum(delta[f] for f in ("shared_blk_read_time", "local_blk_read_time", "temp_blk_read_time")
+                            if f in delta)
+            result["read_time_share"] = (ratio(read_time, delta.get("total_exec_time"))
+                                         if "shared_blk_read_time" in delta else None)
             result["toplevel"] = current.get("toplevel")
         if name == "table_io":
             result["heap_hit_ratio"] = (ratio(delta["heap_blks_hit"], delta["heap_blks_hit"] + delta["heap_blks_read"])
@@ -237,9 +254,44 @@ def section_deltas(before, after, name, warnings):
             result["rollback_ratio"] = (ratio(delta["xact_rollback"], delta["xact_commit"] + delta["xact_rollback"])
                                         if {"xact_commit", "xact_rollback"} <= delta.keys() else None)
         output.append(result)
+    if new_in_interval:
+        warnings.append(f"{name}: {new_in_interval} entry(ies) created during the interval counted from zero")
     for reason, count in sorted(excluded.items()):
         warnings.append(f"{name}: excluded {count} row(s): {reason}")
     return output
+
+
+def lock_chains(snapshot):
+    """Root blockers with every session waiting behind them, built from pg_blocking_pids()."""
+    sessions = {}
+    for row in rows(snapshot, "locks") + rows(snapshot, "activity"):
+        if row.get("pid") is not None:
+            sessions.setdefault(row["pid"], {}).update({k: v for k, v in row.items() if v is not None})
+    blocked_by = {pid: list(row["blocking_pids"]) for pid, row in sessions.items() if row.get("blocking_pids")}
+    waiters_of = {}
+    for pid, blockers in blocked_by.items():
+        for blocker in blockers:
+            waiters_of.setdefault(blocker, set()).add(pid)
+    chains, reached = [], set()
+    for root in sorted(pid for pid in waiters_of if not blocked_by.get(pid)):
+        seen, frontier, depth = {root}, [root], 0
+        while frontier:
+            frontier = [w for p in frontier for w in waiters_of.get(p, ()) if w not in seen]
+            seen.update(frontier)
+            depth += bool(frontier)
+        reached |= seen
+        row = sessions.get(root, {})
+        chains.append({"root_pid": root, "prepared_transaction": root == 0, "state": row.get("state"),
+                       "xact_start": row.get("xact_start"), "backend_start": row.get("backend_start"),
+                       "wait_event_type": row.get("wait_event_type"), "wait_event": row.get("wait_event"),
+                       "query_id": row.get("query_id"), "blocked_sessions": len(seen) - 1, "max_depth": depth,
+                       "direct_waiters": sorted(waiters_of[root])})
+    chains.sort(key=lambda x: x["blocked_sessions"], reverse=True)
+    cycle = sorted(set(blocked_by) - reached)
+    if cycle:
+        # Waiters with no root are in a cycle: a deadlock not yet resolved by deadlock_timeout.
+        chains.append({"root_pid": None, "cycle_pids": cycle, "blocked_sessions": len(cycle)})
+    return chains
 
 
 def xmin_horizon_holders(snapshot):
@@ -429,6 +481,7 @@ def analyze(before, after, top=10):
         section = after.get("sections", {}).get(name, {})
         if section.get("status") != "ok" or section.get("truncated"):
             warnings.append(f"current {name}: missing or truncated evidence")
+    current["lock_chains"] = lock_chains(after)[:top]
     current["xmin_horizon_holders"] = xmin_horizon_holders(after)[:top]
     current["redundant_indexes"] = redundant_indexes(rows(after, "indexes"))[:top]
     current["autovacuum_backlog"] = autovacuum_backlog(rows(after, "tables"), settings(after))[:top]
@@ -436,6 +489,7 @@ def analyze(before, after, top=10):
             "window": {"from": before["started_at"], "to": after["finished_at"],
                        "note": "Overall collection bounds; use each section's elapsed_seconds for interval rates."},
             "rankings": rankings, "deltas": deltas, "current": current,
+            "settings": {"before": sa, "after": sb},
             "warnings": list(dict.fromkeys(warnings)), "limitations": LIMITATIONS,
             "next_steps": ["Inspect the relevant skill reference, SQL plan and representative parameter distribution.",
                            "Correlate application traces, OS metrics and incident/change timestamps before recommending changes."]}

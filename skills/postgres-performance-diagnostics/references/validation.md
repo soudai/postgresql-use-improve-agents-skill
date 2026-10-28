@@ -19,6 +19,16 @@
 3. 許可された環境で実施し、同じ測定条件と十分な実行回数で比較する。warm-up、他の負荷、バックグラウンド保守の差も記録する。
 4. 実行時間だけでなく、結果の正しさ、throughput、利用者の応答時間、I/O、temp、WAL、CPU、メモリ、ロック、書き込み側の退行を確認する。
 
+区間レポートを変更前後で取り、`compare_intervals.py`で比べる。
+
+```text
+python scripts/analyze.py before1.json after1.json --format json --output baseline.json
+python scripts/analyze.py before2.json after2.json --format json --output candidate.json
+python scripts/compare_intervals.py baseline.json candidate.json --queryid 123 --output comparison.md
+```
+
+calls数とcalls/sの両方が20%以上違う（負荷が揃っていない）、shared hit ratioが0.2以上違う（cold／warm cacheの差）、rows/callが変わった（結果が変わった可能性）、記録した設定が違う場合に警告する。SQLを書き換えてquery IDが変わった場合は`--map OLD=NEW`で対応付ける。rows/callの一致は結果の一致の必要条件にすぎないため、結果の内容は別途比較する。
+
 個別実行ログやAPMからp95/p99を計算する場合は、観測件数と閾値／サンプリングを示す。スロークエリ閾値で切られたログのpercentileを、全リクエストのpercentileとして報告しない。平均・最大・標準偏差だけから分位点を作らない。
 
 索引追加は代表的な読み取り値だけでなくINSERT／UPDATE／DELETE、VACUUM、WAL、容量を確認する。SQL書き換えではNULL、重複、並び順、境界値、トランザクションの整合性まで確認する。
@@ -107,4 +117,34 @@ Dockerが必要。`--image`は18／19の公式PostgreSQLタグを受け付け、
 
 同日、統合テストのreadiness判定を修正した。公式イメージの初期化用一時サーバ（unixソケットのみ）を準備完了と誤認し、再起動中に接続して失敗することがあった。TCP接続で本番サーバの起動を判定する。
 
-実際の物理／論理レプリケーション構成、実際のdeadlock、managed cloud環境は未検証。deadlock等のログ分類にはJSON fixtureによる検証があるが、実環境での再現試験を代替しない。SQL統計・計画からの出力は調査候補であり、本番の性能改善を実証した結果ではない。全Issueの完了条件が達成済みとは扱わず、対象環境と診断項目ごとに残る検証を実施する。
+## Issue別シナリオ（2026-10-28）
+
+`tests/scenarios.py`で、#3〜#12の問題例・正常例・情報不足例と変更前後の比較を、PostgreSQL 18.6と19rc1で実行した。全80項目（#11の後から追加したcommit時間を含む）が両版で成功。CPU 2個に制限したコンテナ（tmpfs、ネットワーク無効）と、OOM確認用のメモリ640MBのコンテナを使った。主な計測値（18.6／19rc1）:
+
+| Issue | 再現した例 | 変更前→後 |
+| --- | --- | --- |
+| #3 | 少数行のための大量走査、小表・全件集計の妥当なSeq Scan、並列計画のloops | 索引追加で10.8→0.06 ms／回（同じ30値×2回、結果一致）。単純合算は実行時間を超え、自己時間の合計は一致 |
+| #4 | cold／warm cache、低ヒット率でも読み取り待ちの小さいバッチ、timing無効、ゼロ分母、reset | 範囲検索のヒット率0.06→1.00を条件差として警告。バッチの`read_time_share`は0.04 |
+| #5 | Sort／Hash join／HashAgg／並列workerのspill、ログ閾値外のspill | 対象処理だけ`work_mem`を上げてtemp 4004→0ブロック／回、157→143 ms（19rc1は153→127 ms） |
+| #6 | ORDER BY LIMITの誤った索引走査、JOIN内側の全件走査、十分な索引、ソートが妥当な大量取得、冗長索引 | 偏った値`failed`で45.8→0.07 ms、JOINで25.2→0.6 ms。INSERTのWALは1.98倍 |
+| #7 | 正常な高QPS、意図した大量取得、過剰取得、N+1（trace） | SQL／request 21→2、p95 4.4→1.5 ms、DB時間7.6→2.4 ms、転送量760→779 B／request、結果一致 |
+| #8 | 3段以上の待機チェーン、idle in transaction、DDL待ちに並ぶSELECT、deadlock | 更新順序の統一でdeadlock 1→0／round、ロールバック6→0、ログ上の待機時間合計801→405 ms |
+| #9 | 相関列、古い統計、job queueでのgeneric planの誤推定 | 拡張統計とANALYZEで推定誤差が消える。代表値の重み付き実行時間はgeneric 3.6→custom 3.0 ms（19rc1は3.1→2.0 ms） |
+| #10 | 更新過多（VACUUMで回収）、古いsnapshot（回収不能、保持元を特定）、再利用可能な空き領域、HOT、heap fetches | fillfactor 70でHOT率0→0.41。空き領域48.8%に5万行を挿入してもファイルサイズ不変 |
+| #11 | 実streaming standby、replay停止、停止slot、checkpoint過多と更新量増大、同期commit待ち | `max_wal_size` 32MB→1GBでFPI 25.8k→18.2k。停止slotが58MBを保持。commit中央値 local 0.17／on 0.35／remote_apply 0.36 ms |
+| #12 | CPU飽和（6セッション／2 CPU）、poolによる同時実行の制限、parallel worker不足、OOM kill | pool 2でDB時間／クエリ0.32倍、throughputは同等。CPU 200%。work_mem 4GBでbackendがOOM kill（cgroupのoom_kill=1）、64MBではspillして完了 |
+
+再現できなかった項目:
+
+- ストレージ遅延によるI/O待ち（#4、#12）。tmpfsではOSキャッシュと同等の速度で読めるため、`read_time_share`が小さい例しか作れない。実ストレージかI/O遅延を注入できる環境で、`IO:DataFileRead`の割合と`read_time_share`の大きい例を確認する。
+- generic planの退行による大きな時間差（#9）。誤推定の検出は両版で再現したが、このデータでの時間差は18.6で約16%と小さく、測定ごとの揺らぎと区別しにくい。繁忙時負荷での比較も未実施。
+- アーカイブの失敗、論理レプリケーションのdecoding spill（#11の完了条件外）。
+
+版による差:
+
+- 19rc1では、Index Only Scanがheapを読むとvisibility mapが更新され、VACUUMなしでも2回目以降のHeap Fetchesが0になる（18.6は毎回49999）。
+- `pg_stat_statements`の`generic_plan_calls`／`custom_plan_calls`は19rc1にあり、18.6にはない。
+
+シナリオ作成中に見つけて修正した不具合: 区間中に作成された`pg_stat_statements`のエントリが順位から漏れていた（`stats_since`で区間内の作成と分かる場合は0から数える）。PostgreSQL 15以降のbackend強制終了ログ（`client backend (PID …) was terminated by signal 9`）を分類できなかった。サーバ起動時の`-c`指定は`ALTER SYSTEM`より優先されるため、設定スキルの手順に`pg_settings.source`の確認を追加した。
+
+実際の論理レプリケーション構成、managed cloud環境は未検証。deadlock等のログ分類にはJSON fixtureによる検証があるが、実環境での再現試験を代替しない。SQL統計・計画からの出力は調査候補であり、本番の性能改善を実証した結果ではない。全Issueの完了条件が達成済みとは扱わず、対象環境と診断項目ごとに残る検証を実施する。

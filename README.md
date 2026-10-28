@@ -7,7 +7,7 @@ PostgreSQL 18・19の統計情報、実行計画、ログを使い、改善す�
 - `skills/postgres-performance-diagnostics/SKILL.md`: エージェントの入口と調査の分岐。
 - `references/`: 待機イベント、SQL・索引、I/O・メモリ、ロック、保守・レプリケーションの診断手順。
 - `sql/`: 読み取り用の収集SQLと、その依存ビューを記録するマニフェスト。
-- `scripts/`: スナップショット収集、待機サンプリング、区間差分、実行計画、JSONログの解析。
+- `scripts/`: スナップショット収集、待機サンプリング、区間差分、変更前後の比較、実行計画、JSONログ、アプリtraceの解析。
 - `skills/postgres-config-tuning/`: 設定（postgresql.conf・ロール単位・parameter group）の見直しと変更計画を作る別スキル。
 
 統計から出せるのは調査候補です。Seq Scan、低ヒット率、高い実行回数だけで異常とは判定せず、実行計画やアプリの情報で原因を確認します。DDL・設定変更・セッション終了を自動適用するツールではありません。
@@ -128,6 +128,15 @@ docker pull postgres:19rc1-bookworm
 python tests/integration.py --image postgres:19rc1-bookworm
 ```
 
+各Issueの問題例・正常例・情報不足例と変更前後の比較は、シナリオテストで再現します。CPUを2個に制限した使い捨てコンテナと、OOM確認用にメモリを640MBに制限したコンテナを使い、10分程度かかります。
+
+```powershell
+python tests/scenarios.py --image postgres:18-bookworm --report reports/scenarios-18.json
+python tests/scenarios.py --image postgres:19rc1-bookworm --only 3 9 --report reports/scenarios-19.json
+```
+
+`--only`で対象のIssue番号を絞れます。結果のJSONには、各確認項目の成否と、変更前後の計測値（実行時間、WAL量、HOT率等）が残ります。
+
 テストは新しい使い捨てコンテナを作り、合成データと`pg_stat_statements`を使います。ホストのポート・データディレクトリは公開／マウントせず、コンテナのネットワークを無効化します。テスト自身が作ったコンテナだけを識別して終了時に削除します。スクリプトはイメージを自動取得しません。
 
-2026-10-26の検証では、ユニットテスト55件、スキル形式の検証、PostgreSQL 18.6／19rc1の統合テストが成功しました。合成データでの収集・解析・誤比較の防止を確認した結果であり、本番負荷での性能改善や、全Issueの完了条件を満たしたという意味ではありません。2026-10-28に追加した待機サンプリングと設定最適化スキルは、ユニットテスト80件と18.6／19rc1の統合テストで確認しました。実レプリケーション構成、実際のdeadlock、managed cloud環境は未検証です。[検証範囲](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。
+2026-10-26の検証では、ユニットテスト55件、スキル形式の検証、PostgreSQL 18.6／19rc1の統合テストが成功しました。合成データでの収集・解析・誤比較の防止を確認した結果であり、本番負荷での性能改善や、全Issueの完了条件を満たしたという意味ではありません。2026-10-28に追加した待機サンプリングと設定最適化スキルは、ユニットテスト80件と18.6／19rc1の統合テストで確認しました。同日、Issue #3〜#12のシナリオ80項目が18.6／19rc1で成功し（ユニットテストは89件）、実streaming standbyと実deadlockも確認しました。ストレージ遅延によるI/O待ちと、generic plan退行の大きな時間差は再現できていません。実レプリケーション構成、実際のdeadlock、managed cloud環境は未検証です。[検証範囲](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。

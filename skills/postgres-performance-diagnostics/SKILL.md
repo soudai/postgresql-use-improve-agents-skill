@@ -28,6 +28,8 @@ description: Diagnose PostgreSQL 18 and 19 performance using wait-event sampling
 
 症状が既に絞られていれば（特定APIだけ遅い、ロック待ちのアラート等）、該当する手順から始めてよい。
 
+アプリのリクエスト単位のtraceがあれば`scripts/analyze_trace.py`でN+1・過剰取得・pool待ちを判定する。変更の効果は、変更前後の区間レポートを`scripts/compare_intervals.py`で比べ、負荷量・キャッシュ条件・結果件数・設定の差を確認してから結論にする。
+
 ## 症状に応じて読む
 
 | 症状・目的 | 手順 | 主な追加入力 |

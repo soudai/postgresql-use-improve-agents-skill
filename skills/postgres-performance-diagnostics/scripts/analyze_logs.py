@@ -15,6 +15,8 @@ import sys
 TEMP = re.compile(r'^temporary file: path ".*", size ([0-9]+)\s*$', re.DOTALL)
 DURATION = re.compile(r'^duration:\s+([0-9]+(?:\.[0-9]+)?)\s+ms\b(.*)', re.DOTALL)
 LOCK = re.compile(r'^process [0-9]+ (still waiting for|acquired) .+ after ([0-9]+(?:\.[0-9]+)?) ms(?:\s|$)', re.DOTALL)
+# PostgreSQL 15+ names the process type ("client backend (PID ...)"); older servers say "server process".
+KILLED = re.compile(r"^(.+?) \(PID [0-9]+\) was terminated by signal ([0-9]+)")
 MAX_LINE_CHARS = 2 * 1024 * 1024
 MAX_GROUPS = 1000
 LIMITATIONS = [
@@ -80,6 +82,13 @@ def observed_event(record, line_number, include_details):
         event = {"kind": "checkpoint_complete"}
     elif state == "55P03":
         event = {"kind": "lock_not_available"}
+    elif (match := KILLED.match(message)):
+        # Signal 9 is usually the kernel OOM killer; every session is reset by the crash restart.
+        event = {"kind": "backend_killed", "process": match.group(1), "signal": int(match.group(2))}
+    elif message.startswith("terminating any other active server processes"):
+        event = {"kind": "crash_restart"}
+    elif state == "53200":
+        event = {"kind": "out_of_memory"}
     if event is None:
         return None
     event["line"] = line_number
@@ -176,6 +185,8 @@ def analyze(lines, max_events=1000, include_details=False):
         "lock_not_available": "Inspect NOWAIT or lock_timeout behavior and the application retry policy.",
         "checkpoint_start": "Compare checkpoint frequency with the observation window, WAL rate and storage latency.",
         "autovacuum": "Compare vacuum duration, update rates, oldest snapshots and table-specific settings.",
+        "backend_killed": "A backend was killed (signal 9 is usually the OOM killer); check memory limits, work_mem x concurrency and the kernel/cgroup OOM log.",
+        "out_of_memory": "PostgreSQL could not allocate memory; check work_mem, hash_mem_multiplier, parallel workers and concurrent queries.",
     }
     for kind, next_step in actions.items():
         count = report["summary"]["event_counts"].get(kind, 0)

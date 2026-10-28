@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 import sys
 
 
@@ -27,6 +28,7 @@ DETAIL_FIELDS = (
     "Filter", "Index Cond", "Hash Cond", "Merge Cond", "Join Filter", "Sort Key",
     "Group Key", "Output", "Function Call", "Recheck Cond",
 )
+PARAMETER = re.compile(r"\$[0-9]+")
 LIMITATIONS = [
     "Candidates are investigation leads, not proof of a missing index or an unsafe setting.",
     "Actual Rows and rows removed are per-loop averages; total output is approximate when rounded.",
@@ -82,7 +84,7 @@ def analyze(data, include_details=False):
     report = {"schema_version": 1, "kind": "explain_analysis", "plans": [],
               "limitations": list(LIMITATIONS)}
     for plan_index, document in enumerate(documents(data)):
-        plan = {"index": plan_index, "nodes": [], "candidates": []}
+        plan = {"index": plan_index, "nodes": [], "candidates": [], "uses_parameter_placeholders": False}
         for source, target in (("Planning Time", "planning_time_ms"), ("Execution Time", "execution_time_ms")):
             if number(document.get(source)):
                 plan[target] = document[source]
@@ -99,6 +101,9 @@ def analyze(data, include_details=False):
                                    ("Sort Method", "sort_method"), ("Sort Space Type", "sort_space_type")):
                 if isinstance(raw.get(source), str):
                     node[target] = raw[source]
+            # $n in a condition means a generic plan (prepared statement); only a flag is kept, never the text.
+            if any(isinstance(raw.get(key), str) and PARAMETER.search(raw[key]) for key in DETAIL_FIELDS if key != "Output"):
+                plan["uses_parameter_placeholders"] = True
             if include_details:
                 node["details"] = {key: raw[key] for key in DETAIL_FIELDS if key in raw}
             loops, actual, estimated = (raw.get(key) for key in ("Actual Loops", "Actual Rows", "Plan Rows"))
@@ -193,6 +198,10 @@ def analyze(data, include_details=False):
                 stack.append((children[child_index], f"{path}/Plans/{child_index}", below_limit or raw["Node Type"] == "Limit"))
         plan["root_buffers"] = {key: value for key, value in plan["nodes"][0]["metrics"].items() if "Blocks" in key}
         plan["hotspots"] = hotspots(plan["nodes"], plan.get("execution_time_ms"))
+        plan["candidates"] += join_candidates(plan["nodes"])
+        if plan["uses_parameter_placeholders"] and any(c["kind"] == "cardinality_mismatch" for c in plan["candidates"]):
+            plan["candidates"].append({"kind": "generic_plan_misestimate", "path": "Plan", "evidence": {},
+                                       "next_step": "A generic plan was misestimated; compare custom plans for representative parameter values before changing plan_cache_mode for that statement."})
         plan_ms, exec_ms = plan.get("planning_time_ms"), plan.get("execution_time_ms")
         if number(plan_ms) and number(exec_ms) and plan_ms >= 10 and plan_ms > exec_ms:
             plan["candidates"].append({"kind": "planning_dominates", "path": "Plan",
@@ -205,6 +214,29 @@ def analyze(data, include_details=False):
                                        "next_step": "JIT compile time is a large share; compare with jit_above_cost raised or jit off for this workload."})
         report["plans"].append(plan)
     return report
+
+
+def join_candidates(nodes):
+    """A join that keeps <=1% of a large scanned input: an index on the join key may avoid the scan."""
+    by_path = {node["path"]: node for node in nodes}
+    found = []
+    for node in nodes:
+        if node["node_type"] not in ("Hash Join", "Merge Join", "Nested Loop") or node["cardinality"]["status"] != "observed":
+            continue
+        output = node["cardinality"]["approximate_total_output_rows"]
+        for index in range(2):
+            child = by_path.get(f"{node['path']}/Plans/{index}")
+            if child and child["node_type"] == "Hash":
+                child = by_path.get(child["path"] + "/Plans/0")
+            if not child or "Scan" not in child["node_type"] or child["cardinality"]["status"] != "observed":
+                continue
+            scanned = child["cardinality"]["approximate_total_output_rows"]
+            if scanned >= 100000 and output <= scanned * 0.01:
+                found.append({"kind": "join_discards_scanned_rows", "path": child["path"],
+                              "evidence": {"join_path": node["path"], "join_type": node["node_type"],
+                                           "scanned_rows": scanned, "join_output_rows": output},
+                              "next_step": "Most scanned rows find no join partner; check an index on this side's join key or filtering before the join."})
+    return found
 
 
 def hotspots(nodes, execution_ms, limit=5):

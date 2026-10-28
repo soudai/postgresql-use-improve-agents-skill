@@ -11,7 +11,7 @@
 | テーブル単位 | `ALTER TABLE ... SET (autovacuum_... = ...)`、`ALTER TABLESPACE ... SET (random_page_cost = ...)` | 全体の既定値を変えずに例外を作る |
 | managed service | parameter group・フラグ | 適用タイミングと再起動の要否は提供者の仕様に従う |
 
-優先順位はトランザクション・セッション＞ロール＋DB＞ロール＞DB＞`postgresql.auto.conf`＞`postgresql.conf`。変更後に`pg_settings.source`で、どこから値が来ているか確認する。
+優先順位はトランザクション・セッション＞ロール＋DB＞ロール＞DB＞サーバ起動時のコマンドライン（`-c`、systemdやコンテナの起動引数）＞`postgresql.auto.conf`＞`postgresql.conf`。変更後に`pg_settings.source`で、どこから値が来ているか確認する。`source`が`command line`の値は、`ALTER SYSTEM`やconfを変えてもreload・再起動で反映されない。起動引数側を変える。
 
 ## 適用手順
 

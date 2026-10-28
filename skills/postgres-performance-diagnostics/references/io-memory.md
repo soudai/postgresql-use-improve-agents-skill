@@ -14,6 +14,8 @@ SQL単位のshared buffer hit ratio
 
 前者は`pg_stat_statements`、後者は`pg_statio_user_tables`の同じ単位のブロック数から求める。分母0は未定義。`pg_stat_io.reads`は複数ブロックをまとめたI/O操作の回数を数える場合があるため、一般形の`Δhits / (Δhits + Δreads)`をどのビューにもそのまま適用しない。実バージョンの列定義と単位を確認する。
 
+低ヒット率のSQLが利用者を待たせているかは、`analyze.py`の`read_time_share`（実行時間のうち読み取り待ちの割合、`track_io_timing`が必要）で見分ける。ヒット率が低くても割合が小さければ、OSキャッシュ等で読み取りが速く、I/Oは主な待ち時間ではない。割合が大きければ、待機サンプルの`IO:DataFileRead`とストレージの遅延を確認する。変更前後でcold／warm cacheが違うと、`compare_intervals.py`がヒット率の差として警告する。
+
 PostgreSQLのbuffer missはOSページキャッシュで満たされることがあり、物理ディスクI/Oと同じではない。高ヒット率でも論理読み取りが大量ならCPUやメモリ帯域を消費する。低ヒット率の一括処理を無条件に異常にしない。
 
 `pg_stat_io`はbackend_type／object／context等の集計。単独で特定SQLやテーブルに帰属させず、SQL別統計、relation統計、計画と観測時間を照合する。SQLとテーブルで見えるアクセスを足してクラスタの物理I/Oにしない。版による列の単位の差、block_size、read／write／extend／fsyncの区別を確認する。
@@ -34,7 +36,15 @@ Sortのdisk使用、Hashの複数batch、集約やJOINの中間結果を調べ�
 
 ## 接続とCPU・メモリ
 
-DB内実行、lock／I/O待ち、pool待ち、接続確立、ネットワーク、結果受信・変換を分ける。pool待ちのリクエストはDBのactivityにまだ現れない場合がある。
+DB内実行、lock／I/O待ち、pool待ち、接続確立、ネットワーク、結果受信・変換を分ける。pool待ちのリクエストはDBのactivityにまだ現れない場合がある。traceに`pool_wait_ms`を記録すれば、`analyze_trace.py`がエンドポイントごとのpool待ちの割合を出す。
+
+| 観測できる場所 | 分かること |
+| --- | --- |
+| DB統計（待機サンプル、`active_time`、`pg_stat_statements`） | DB内の実行・待機、平均アクティブセッション、SQL別の実行時間、parallel workerの計画数と起動数 |
+| OS／コンテナ（CPU使用率、run queue、RSS、swap、cgroupの`memory.events`） | CPU飽和の確定、メモリ圧迫、OOM killの発生 |
+| アプリ（trace、poolの指標） | pool待ち、接続確立、ネットワーク、結果変換、利用者の応答時間 |
+
+CPU飽和は、平均アクティブセッション数がCPU数を超え、待機イベントのない実行が大半を占め、OSのCPU使用率も上限に張り付く状態。同時実行をpoolで絞ると、DB内の1クエリ当たり時間は下がり、待ちはアプリ側のpool待ちに移る。throughputと利用者の応答時間で評価する。OOM killは`analyze_logs.py`の`backend_killed`（signal 9）とcgroupの`oom_kill`で確認する。全セッションが再接続になるため、work_mem×同時実行の予算を見直す。
 
 CPU・I/O・LWLockのどこに時間を使っているかは、まず[待機のサンプリング](wait-events.md)で内訳を取る。CPUの割合が高ければ、`analyze.py`の`sql_shared_blks_accessed`（ヒットを含む論理読み取り）で上位のSQLを探す。ヒット率が高くても論理読み取りが多ければCPUを消費する。
 

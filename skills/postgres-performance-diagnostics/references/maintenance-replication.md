@@ -19,7 +19,9 @@ PostgreSQL 18は`pg_stat_user_tables`の`total_autovacuum_time`等でVACUUM・AN
 
 必要なら`pgstattuple`や`pgstattuple_approx`を使う。導入・実行の権限と提供環境の対応を確認し、全表走査／I/Oコストが大きい操作は対象サイズと実行時間帯を絞る。approxも常に低負荷とは限らない。索引は方式に応じた検査を選び、B-tree向け情報を他方式へそのまま適用しない。
 
-HOT更新の割合は区間の更新数を母数にする。更新列と索引、ページ内の空き領域、fillfactorを確認する。低HOT率だけでは不適切な索引設計と断定しない。visibility mapとIndex Only ScanのHeap Fetchesも併せて確認する。
+HOT更新の割合は区間の更新数を母数にする。更新列と索引、ページ内の空き領域、fillfactorを確認する。低HOT率だけでは不適切な索引設計と断定しない。全行を更新する負荷では、fillfactor 100の表はHOT率がほぼ0になり、fillfactor 70では空き領域に収まる分（約4割）がHOTになる（PostgreSQL 18／19rc1のシナリオで確認）。visibility mapとIndex Only ScanのHeap Fetchesも併せて確認する。
+
+PostgreSQL 18ではVACUUMされていないページのHeap Fetchesが毎回発生し、VACUUMで解消する。19rc1では、Index Only Scanがheapを読んだときにvisibility mapが更新され、VACUUMなしでも2回目以降のHeap Fetchesが0になることを観測した。19ではHeap Fetchesが初回の計画だけに現れるため、取得した計画が初回かどうかを確認する。
 
 XID／MXID ageはwraparound対策の緊急性に関わる。設定されたfreeze上限、進行速度、進捗、回収を妨げる保持元を確認し、通常の性能改善と区別して優先度を示す。
 

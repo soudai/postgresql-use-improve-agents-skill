@@ -4,6 +4,8 @@
 
 activity、locks、prepared transactionsのsnapshotを使う。発生中なら取得時刻を揃えた複数回の観測で追い、解消済みならログを優先する。PIDの再利用を避けるためbackend_start／session IDも残す。
 
+`analyze.py`の`current.lock_chains`は、snapshotの`pg_blocking_pids()`から根本blocker（自身は待っていないblocker）ごとに、間接的な待機者を含む数（`blocked_sessions`）、最長の待機段数（`max_depth`）、直接の待機者を示す。根本のない循環は`cycle_pids`として、`deadlock_timeout`前の未解決deadlockの候補を示す。DDLの待機列に並んだSELECTは、DDLのセッションをblockerとして持つ。
+
 `pg_blocking_pids()`を起点に待機元からblockerを辿り、根本blocker、待機チェーン、影響セッション数、対象DB／relation、lock modeを示す。単純な`pg_locks`自己JOINだけでblockerを確定しない。多数のセッションへ高頻度で繰り返し呼ぶと観測負荷があるため、必要な頻度に絞る。
 
 | 観測 | 解釈 |

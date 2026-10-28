@@ -43,7 +43,7 @@ PostgreSQL 18以降は`ANALYZE`指定時に`BUFFERS`が既定で有効。`SELECT
 
 `analyze_plan.py`の`hotspots`は、各ノードの`Actual Total Time × loops`から子ノード分を引いた自己時間の上位。手順2の出発点に使う。parallel workerのノードは各プロセスの合計になり実時間を超え得る。CTE・SubPlanの再利用でも近似になる。
 
-自動候補のうち、`repeated_seq_scan`はNested Loopの内側で繰り返すSeq Scan、`lossy_bitmap`は`work_mem`を超えてページ単位の再検査になったBitmap Heap Scan、`index_only_heap_fetches`はvisibility mapが古くheapを読んだIndex Only Scan、`planning_dominates`・`jit_overhead`は計画・JITの時間が実行に比べて大きい計画を示す。
+自動候補のうち、`repeated_seq_scan`はNested Loopの内側で繰り返すSeq Scan、`lossy_bitmap`は`work_mem`を超えてページ単位の再検査になったBitmap Heap Scan、`index_only_heap_fetches`はvisibility mapが古くheapを読んだIndex Only Scan、`planning_dominates`・`jit_overhead`は計画・JITの時間が実行に比べて大きい計画を示す。`join_discards_scanned_rows`は10万行以上を走査した入力のうち1%以下しか結合結果に残らないJOINで、その側の結合キーの索引を検討する。`uses_parameter_placeholders`は条件に`$1`等が残るgeneric planであることを示し、推定誤差と重なると`generic_plan_misestimate`になる。
 
 LIMITによって上位ノードが途中で処理を止めた場合や、実行されなかった枝では、通常の全件実行と同じ条件で行数を比較できない。実測がない計画は、実行時間・spill・実際の読み取り量を証明しない。
 
@@ -82,13 +82,36 @@ JOINでは内側アクセスの反復数と返却量、ORDER BY／LIMITでは必
 
 高callsは正常な高トラフィックでも起こる。N+1を確認するには、同一リクエスト／ジョブで親の件数に応じて同形SQLが反復するtraceと呼出箇所を使う。証拠がない場合は「N+1候補」とし、必要なtraceを指定する。
 
+traceはJSON Linesで、リクエストとDB呼び出しを1行ずつ記録する。APMやORMのログから次の形に変換する。
+
+```json
+{"type": "request", "request_id": "r1", "endpoint": "GET /orders", "duration_ms": 120.5, "pool_wait_ms": 3.2}
+{"type": "db", "request_id": "r1", "statement": "orders_of_customer", "query_id": "-12345", "rows": 20, "rows_used": 20, "duration_ms": 2.1, "code_location": "orders.py:20"}
+```
+
+`statement`か`query_id`で同形SQLを識別する。`rows_used`（アプリが実際に使った行数）、`bytes`（受信した結果のバイト数）、`pool_wait_ms`、`code_location`は任意だが、ないと過剰取得・転送量・pool待ち・呼出箇所を判定できない。リクエスト内の全DB呼び出しに`bytes`があれば、エンドポイントごとの1リクエスト当たり転送量を出す。
+
+```text
+python scripts/analyze_trace.py trace.jsonl --format markdown --output trace-report.md
+```
+
+| 分類 | 判定 |
+| --- | --- |
+| `n_plus_one` | 同じリクエストで同形SQLが`--repeat`回（既定5）以上反復し、その回数が先行SQLの返却行数とほぼ一致 |
+| `repeated_statement` | 反復するが、親の件数と対応しない（polling等） |
+| `over_fetching` | 100行以上を取得し、使ったのが10%以下 |
+| `large_result` | 10000行以上。`intended`は取得行の90%以上を使った場合 |
+| `high_frequency_normal` | 呼び出しが多いが、1リクエスト当たり2回以下 |
+
+p50／p95／p99はtrace内の個別リクエストから計算する。トレーサーのサンプリング条件をレポートに併記する。
+
 eager loading、JOIN、バッチ取得は結果の多重化・順序・整合性・アプリメモリ使用まで検証する。評価指標はSQL回数／request、転送量、API時間、DB累積負荷。DB実行時間だけで通信や結果変換を含む利用者の応答時間を説明しない。
 
 ## 見積もりと計画退行
 
 古い統計、MCV／histogramで表せない偏り、列間相関、統計ターゲットを確認する。ANALYZE、列単位の統計ターゲット、CREATE STATISTICSは対象と費用を明示して提案する。拡張統計ですべてのJOIN推定誤差が解決するとは扱わない。
 
-prepared statementではgeneric／custom plan、パラメータ分布、型を確認する。`plan_cache_mode`の全体変更で特定例だけを直さない。DDL、設定、デプロイ、統計更新の前後で、同じqueryidでも計画が変わることを考慮する。
+prepared statementではgeneric／custom plan、パラメータ分布、型を確認する。`plan_cache_mode`の全体変更で特定例だけを直さない。同じセッションで`PREPARE`し、`plan_cache_mode`を`force_generic_plan`／`force_custom_plan`に切り替えて、代表値ごとの`EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE`を比べる。値の出現頻度で重み付けした合計で判断する。PostgreSQL 19の`pg_stat_statements`（19rc1で確認、18にはない）は`generic_plan_calls`・`custom_plan_calls`で、実際にどちらが使われたかを示す。18では`auto_explain`の計画や、同じセッションでの`EXPLAIN EXECUTE`で確認する。DDL、設定、デプロイ、統計更新の前後で、同じqueryidでも計画が変わることを考慮する。
 
 計画時間、JIT時間、parallel worker不足、関数・トリガー内部の負荷も候補になる。計画時間計測が無効な場合の0を「planning負荷なし」としない。関数内SQLは必要に応じて追跡設定やauto_explainのnested statement採取を検討する。
 

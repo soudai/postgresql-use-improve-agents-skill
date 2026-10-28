@@ -108,6 +108,16 @@ class IntervalTests(unittest.TestCase):
         a["sections"]["pgss"]["rows"] = []
         self.assertEqual(MODULE.analyze(a, b)["deltas"]["pgss"], [])
 
+    def test_entry_created_inside_interval_counts_from_zero(self):
+        a, b = pair()
+        a["sections"]["pgss"]["rows"] = []
+        b["sections"]["pgss"]["rows"][0]["stats_since"] = "2026-10-26T00:00:30+00:00"
+        report = MODULE.analyze(a, b)
+        entry = report["deltas"]["pgss"][0]
+        self.assertEqual(entry["delta"]["calls"], 12)
+        self.assertEqual(entry["delta"]["total_exec_time"], 110)
+        self.assertTrue(any("created during the interval" in w for w in report["warnings"]))
+
     def test_null_and_duplicate_queryids_do_not_merge(self):
         for target in ("null", "old_duplicate", "new_duplicate"):
             a, b = pair()
