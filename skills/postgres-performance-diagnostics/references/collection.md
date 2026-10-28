@@ -16,6 +16,8 @@ python scripts/analyze.py before.json after.json --format markdown --output inte
 
 収集自体もSQLを実行するため統計に影響する。識別できる収集SQLを除外しても、`BEGIN`・`SET`・`COMMIT`等のutility statementが`pg_stat_statements`に残る場合がある。高calls候補をアプリの処理と対応させるときは、収集間隔・時刻・tracking設定を確認する。これを消すために統計をresetしない。
 
+累積統計は「どのSQLが時間を使ったか」を示すが、その時間の待機内訳は示さない。症状が出ている間は`scripts/sample_activity.py`で待機をサンプリングし、snapshotの区間と時刻を揃えて照合する。接続・権限・`--docker-container`の扱いは`collect.py`と同じ。手順と解釈は[wait-events.md](wait-events.md)を参照。
+
 ローカル検証用の既存コンテナには`--docker-container NAME`を指定できる。この場合はコンテナ内の`psql`とlibpq環境を使い、ホストの`PG*`環境変数は引き継がない。接続先が意図した検証DBであることを確認する。
 
 ## 最初に残す情報

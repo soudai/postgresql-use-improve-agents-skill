@@ -21,6 +21,7 @@ METRICS = (
     "Temp I/O Read Time", "Temp I/O Write Time", "Sort Space Used", "Hash Buckets",
     "Original Hash Buckets", "Hash Batches", "Original Hash Batches", "Peak Memory Usage",
     "HashAgg Batches", "Disk Usage", "Workers Planned", "Workers Launched",
+    "Exact Heap Blocks", "Lossy Heap Blocks", "Cache Hits", "Cache Misses", "Cache Evictions",
 )
 DETAIL_FIELDS = (
     "Filter", "Index Cond", "Hash Cond", "Merge Cond", "Join Filter", "Sort Key",
@@ -34,6 +35,7 @@ LIMITATIONS = [
     "Parallel node averages and worker distributions require inspecting the original plan.",
     "A saved plan does not describe all parameter values, concurrency levels or cache conditions.",
     "Relation/index names remain visible. SQL expressions are omitted unless --include-details is used.",
+    "Hotspot self time is Actual Total Time x loops minus children; parallel workers and CTE/SubPlan reuse make it approximate.",
 ]
 
 
@@ -118,10 +120,28 @@ def analyze(data, include_details=False):
             node["cardinality"] = cardinality
             if executed:
                 removed = raw.get("Rows Removed by Filter")
-                if number(removed) and number(actual) and removed >= 10000 and removed / max(removed + actual, 1) >= 0.9:
+                # Per-loop values: a small removal repeated by a nested loop is still large in total.
+                if (number(removed) and number(actual) and removed * loops >= 10000
+                        and removed / max(removed + actual, 1) >= 0.9):
                     plan["candidates"].append({"kind": "heavy_filtering", "path": path,
-                                               "evidence": {"removed_per_loop": removed, "output_per_loop": actual, "loops": loops},
+                                               "evidence": {"removed_per_loop": removed, "output_per_loop": actual, "loops": loops,
+                                                            "approximate_total_removed": removed * loops},
                                                "next_step": "Check predicate selectivity and scan cost; a sequential scan may still be appropriate."})
+                recheck = raw.get("Rows Removed by Index Recheck")
+                if number(raw.get("Lossy Heap Blocks")) and raw["Lossy Heap Blocks"] > 0:
+                    plan["candidates"].append({"kind": "lossy_bitmap", "path": path,
+                                               "evidence": {"lossy_heap_blocks": raw["Lossy Heap Blocks"],
+                                                            "exact_heap_blocks": raw.get("Exact Heap Blocks"),
+                                                            "removed_by_recheck_per_loop": recheck},
+                                               "next_step": "The bitmap exceeded work_mem and rechecks whole pages; compare selectivity, a narrower index and work_mem for this query."})
+                if raw["Node Type"] == "Index Only Scan" and number(raw.get("Heap Fetches")) and raw["Heap Fetches"] >= 1000:
+                    plan["candidates"].append({"kind": "index_only_heap_fetches", "path": path,
+                                               "evidence": {"heap_fetches": raw["Heap Fetches"], "actual_rows_per_loop": actual, "loops": loops},
+                                               "next_step": "Pages not all-visible force heap visits; check VACUUM frequency and the visibility map for this table."})
+                if raw["Node Type"] == "Seq Scan" and loops >= 100:
+                    plan["candidates"].append({"kind": "repeated_seq_scan", "path": path,
+                                               "evidence": {"loops": loops, "rows_removed_per_loop": removed},
+                                               "next_step": "A sequential scan re-executed per outer row; check the join method, join-key index and row estimates of the outer side."})
                 batches = raw.get("Hash Batches", raw.get("HashAgg Batches"))
                 if number(batches) and batches > 1:
                     plan["candidates"].append({"kind": "hash_batches", "path": path,
@@ -172,8 +192,40 @@ def analyze(data, include_details=False):
             for child_index in reversed(range(len(children))):
                 stack.append((children[child_index], f"{path}/Plans/{child_index}", below_limit or raw["Node Type"] == "Limit"))
         plan["root_buffers"] = {key: value for key, value in plan["nodes"][0]["metrics"].items() if "Blocks" in key}
+        plan["hotspots"] = hotspots(plan["nodes"], plan.get("execution_time_ms"))
+        plan_ms, exec_ms = plan.get("planning_time_ms"), plan.get("execution_time_ms")
+        if number(plan_ms) and number(exec_ms) and plan_ms >= 10 and plan_ms > exec_ms:
+            plan["candidates"].append({"kind": "planning_dominates", "path": "Plan",
+                                       "evidence": {"planning_ms": plan_ms, "execution_ms": exec_ms},
+                                       "next_step": "Check partition count and pruning, join count, statistics targets and whether a prepared statement could reuse the plan."})
+        jit_ms = plan.get("jit", {}).get("Timing", {}).get("Total")
+        if number(jit_ms) and number(exec_ms) and jit_ms >= 10 and jit_ms >= 0.2 * exec_ms:
+            plan["candidates"].append({"kind": "jit_overhead", "path": "Plan",
+                                       "evidence": {"jit_total_ms": jit_ms, "execution_ms": exec_ms},
+                                       "next_step": "JIT compile time is a large share; compare with jit_above_cost raised or jit off for this workload."})
         report["plans"].append(plan)
     return report
+
+
+def hotspots(nodes, execution_ms, limit=5):
+    """Rank nodes by approximate self time so the reader starts where time is actually spent."""
+    inclusive = {}
+    for node in nodes:
+        metrics = node["metrics"]
+        if number(metrics.get("Actual Total Time")) and number(metrics.get("Actual Loops")):
+            inclusive[node["path"]] = metrics["Actual Total Time"] * metrics["Actual Loops"]
+    result = []
+    for node in nodes:
+        path = node["path"]
+        if path not in inclusive:
+            continue
+        children = sum(value for child, value in inclusive.items()
+                       if child.startswith(path + "/Plans/") and "/Plans/" not in child[len(path) + 7:])
+        self_ms = max(inclusive[path] - children, 0)
+        result.append({"path": path, "node_type": node["node_type"], "relation": node.get("relation"),
+                       "self_ms_approx": self_ms,
+                       "share_of_execution": self_ms / execution_ms if number(execution_ms) and execution_ms > 0 else None})
+    return sorted(result, key=lambda x: x["self_ms_approx"], reverse=True)[:limit]
 
 
 def markdown(report):
@@ -184,6 +236,12 @@ def markdown(report):
                   "Root buffer counts (not a sum of all nodes): " + json.dumps(plan["root_buffers"], ensure_ascii=False), ""]
         if "jit" in plan:
             lines += ["JIT: " + json.dumps(plan["jit"], ensure_ascii=False), ""]
+        if plan["hotspots"]:
+            lines += ["### Self-time hotspots (approximate)", ""]
+            for spot in plan["hotspots"]:
+                share = f"{spot['share_of_execution']:.0%}" if spot["share_of_execution"] is not None else "—"
+                lines.append(f"- `{spot['path']}` {spot['node_type']} {spot.get('relation') or ''}: {spot['self_ms_approx']:.3f} ms ({share})")
+            lines.append("")
         for node in plan["nodes"]:
             identity = ".".join(str(node.get(key, "")) for key in ("schema", "relation")).strip(".")
             lines += [f"- `{node['path']}`: {node['node_type']} {identity}; cardinality={json.dumps(node['cardinality'], ensure_ascii=False)}",

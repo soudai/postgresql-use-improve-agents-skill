@@ -33,13 +33,17 @@ EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON)
 SELECT ...;
 ```
 
-`SELECT ...`は実行対象SQLへ置き換える。実行前に`statement_timeout`と`lock_timeout`、キャンセル方法を決める。更新SQLは実際に更新を行い、SELECTでも関数が副作用を持ち得る。検証DBを使えるなら同じデータ特性で再現する。単にBEGIN／ROLLBACKで囲むだけでは全副作用を抑止できない。
+PostgreSQL 18以降は`ANALYZE`指定時に`BUFFERS`が既定で有効。`SELECT ...`は実行対象SQLへ置き換える。実行前に`statement_timeout`と`lock_timeout`、キャンセル方法を決める。更新SQLは実際に更新を行い、SELECTでも関数が副作用を持ち得る。検証DBを使えるなら同じデータ特性で再現する。単にBEGIN／ROLLBACKで囲むだけでは全副作用を抑止できない。
 
 計画は次の順に調べる。
 
 1. 最終結果と途中結果の行数、初期化・反復回数、フィルタによる除外量を確認する。`Actual Rows`や時間の表示はloops当たりである場合があるため、その計測単位を確認する。
 2. 大量アクセスがあるノードから、スキャン、JOIN、Sort／Hash、集約へ遡る。包含関係のあるノード時間を合算して総時間を水増ししない。並列workerの数と役割も考慮する。
 3. 実測と推定の乖離、バッファ使用、temp、Heap Fetches、worker planned/launchedを確認し、仮説を絞る。
+
+`analyze_plan.py`の`hotspots`は、各ノードの`Actual Total Time × loops`から子ノード分を引いた自己時間の上位。手順2の出発点に使う。parallel workerのノードは各プロセスの合計になり実時間を超え得る。CTE・SubPlanの再利用でも近似になる。
+
+自動候補のうち、`repeated_seq_scan`はNested Loopの内側で繰り返すSeq Scan、`lossy_bitmap`は`work_mem`を超えてページ単位の再検査になったBitmap Heap Scan、`index_only_heap_fetches`はvisibility mapが古くheapを読んだIndex Only Scan、`planning_dominates`・`jit_overhead`は計画・JITの時間が実行に比べて大きい計画を示す。
 
 LIMITによって上位ノードが途中で処理を止めた場合や、実行されなかった枝では、通常の全件実行と同じ条件で行数を比較できない。実測がない計画は、実行時間・spill・実際の読み取り量を証明しない。
 
@@ -52,6 +56,25 @@ LIMITによって上位ノードが途中で処理を止めた場合や、実行
 JOINでは内側アクセスの反復数と返却量、ORDER BY／LIMITでは必要行に達するまでの走査量を見る。候補索引の列順、部分条件、式、INCLUDEを、検索条件と並び順に対応させる。PostgreSQL 18のB-tree skip scanを考慮し、「先頭列の等価条件がないから使用不能」と決めない。Hash JoinやSortの存在自体を索引不足としない。
 
 索引候補には、容量、INSERT／UPDATE／DELETEとWALの追加コスト、制約との関係、作成中の負荷・ロック、失敗時の扱いを添える。`CREATE INDEX CONCURRENTLY`にも制約と負荷がある。重複／未使用候補は、十分な観測期間、稀なバッチ、standbyでの利用、制約依存を確認してから扱う。`idx_scan=0`だけで削除しない。
+
+`analyze.py`の`redundant_indexes`は、同じテーブルで別索引のキー列の先頭と一致する非uniqueのB-tree索引を示す。式・部分索引・INCLUDE付き・制約用の索引は対象外。短い索引の方が小さく速い場合や、standby・稀なバッチだけが使う場合があるため、削除前に計画への影響を確認する。
+
+## 代表的な書き換え
+
+計画と代表パラメータで原因を確認してから適用する。結果の同値性（NULL、重複、並び順）を検証する。
+
+| 計画・SQLの特徴 | 原因の候補 | 比較する対策 |
+| --- | --- | --- |
+| 深い`OFFSET`で読み捨てが大きい | OFFSET分を毎回読む | 並び順キーによるkeyset pagination |
+| 列に関数・型変換があり索引を使わない | 式と索引の不一致、暗黙の型変換 | パラメータ型を列に合わせる、式索引 |
+| 異なる列の`OR`で全件走査 | 単一の索引条件にできない | BitmapOrになる索引、`UNION ALL` |
+| `LIKE 'abc%'`で索引を使わない | 非Cの照合順序 | `text_pattern_ops`の索引、`pg_trgm` |
+| `LIKE '%abc%'`、類似検索 | B-treeでは絞れない | `pg_trgm`のGIN／GiST索引 |
+| `NOT IN (subquery)` | anti joinにできず、hashed SubPlanが`work_mem`に収まらないと行ごとに再実行される | NULLを含む場合の意味の違いを確認した上で`NOT EXISTS` |
+| 巨大な`IN`リストやリテラル埋め込み | 計画時間、queryidの分散 | `= ANY($1::type[])`、一時テーブル／`VALUES`とのJOIN |
+| 相関サブクエリが行ごとに実行される | SubPlanの反復 | JOIN、`LATERAL`、集約の先行 |
+| `count(*)`の正確な件数を頻繁に取得 | 全件走査 | 要件の確認、推定値、集計テーブル |
+| 大量の単一行INSERT／UPDATE | 往復とcommitの回数 | バッチ化、`COPY`、`INSERT ... SELECT` |
 
 ## 大量取得とN+1
 

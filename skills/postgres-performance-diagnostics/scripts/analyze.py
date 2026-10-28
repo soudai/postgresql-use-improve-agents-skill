@@ -15,19 +15,23 @@ PGSS_COUNTERS = (
     "local_blks_hit", "local_blks_read", "local_blks_dirtied", "local_blks_written",
     "temp_blks_read", "temp_blks_written", "shared_blk_read_time", "shared_blk_write_time",
     "local_blk_read_time", "local_blk_write_time", "temp_blk_read_time", "temp_blk_write_time",
-    "wal_records", "wal_fpi", "wal_bytes", "jit_functions", "jit_generation_time",
+    "wal_records", "wal_fpi", "wal_bytes", "wal_buffers_full", "jit_functions", "jit_generation_time",
     "jit_inlining_count", "jit_inlining_time", "jit_optimization_count", "jit_optimization_time",
-    "jit_emission_count", "jit_emission_time", "parallel_workers_to_launch", "parallel_workers_launched",
+    "jit_emission_count", "jit_emission_time", "jit_deform_count", "jit_deform_time",
+    "parallel_workers_to_launch", "parallel_workers_launched", "generic_plan_calls", "custom_plan_calls",
 )
 SPECS = {
     "pgss": (("dbid", "userid", "queryid", "toplevel"), PGSS_COUNTERS),
     "database": (("datid",), ("xact_commit", "xact_rollback", "blks_read", "blks_hit",
         "tup_returned", "tup_fetched", "tup_inserted", "tup_updated", "tup_deleted",
         "temp_files", "temp_bytes", "deadlocks", "blk_read_time", "blk_write_time",
-        "sessions", "sessions_abandoned", "sessions_fatal", "sessions_killed")),
+        "sessions", "sessions_abandoned", "sessions_fatal", "sessions_killed", "session_time",
+        "active_time", "idle_in_transaction_time", "conflicts", "checksum_failures",
+        "parallel_workers_to_launch", "parallel_workers_launched")),
     "tables": (("relid",), ("seq_scan", "seq_tup_read", "idx_scan", "idx_tup_fetch",
         "n_tup_ins", "n_tup_upd", "n_tup_del", "n_tup_hot_upd", "n_tup_newpage_upd",
-        "vacuum_count", "autovacuum_count", "analyze_count", "autoanalyze_count")),
+        "vacuum_count", "autovacuum_count", "analyze_count", "autoanalyze_count",
+        "total_vacuum_time", "total_autovacuum_time", "total_analyze_time", "total_autoanalyze_time")),
     "indexes": (("indexrelid",), ("idx_scan", "idx_tup_read", "idx_tup_fetch")),
     "table_io": (("relid",), tuple(f"{kind}_blks_{op}" for kind in ("heap", "idx", "toast", "tidx")
                                      for op in ("read", "hit"))),
@@ -37,7 +41,8 @@ SPECS = {
         "extend_bytes", "extend_time", "hits", "evictions", "reuses", "fsyncs", "fsync_time")),
     "wal": ((), ("wal_records", "wal_fpi", "wal_bytes", "wal_buffers_full")),
     "checkpointer": ((), ("num_timed", "num_requested", "num_done", "restartpoints_timed",
-        "restartpoints_req", "restartpoints_done", "write_time", "sync_time", "buffers_written")),
+        "restartpoints_req", "restartpoints_done", "write_time", "sync_time", "buffers_written",
+        "slru_written")),
     "bgwriter": ((), ("buffers_clean", "maxwritten_clean", "buffers_alloc")),
     "archiver": ((), ("archived_count", "failed_count")),
     "conflicts": (("datid",), ("confl_tablespace", "confl_lock", "confl_snapshot",
@@ -56,7 +61,13 @@ LIMITATIONS = [
     "Per-object resets without a visible reset marker may be undetectable if counters grow past the old value.",
     "Collector SELECTs are filtered by a marker, but monitoring BEGIN/SET/COMMIT utility calls may remain in pg_stat_statements.",
     "n_dead_tup is an estimate, not a physical bloat ratio; zero index scans are not permission to drop an index.",
+    "exec_time_share uses comparable top-level entries only; nested (track=all) and excluded entries are not in the denominator.",
+    "Redundant-index and autovacuum-backlog lists are rule-based candidates from one snapshot; verify definitions and settings first.",
 ]
+AUTOVACUUM_RELOPTIONS = ("autovacuum_enabled", "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
+                         "autovacuum_vacuum_max_threshold", "autovacuum_vacuum_insert_threshold",
+                         "autovacuum_vacuum_insert_scale_factor", "autovacuum_analyze_threshold",
+                         "autovacuum_analyze_scale_factor")
 
 
 def timestamp(value):
@@ -209,15 +220,142 @@ def section_deltas(before, after, name, warnings):
                                            if "shared_blks_read" in delta else None)
             result["shared_hit_ratio"] = (ratio(delta["shared_blks_hit"], delta["shared_blks_hit"] + delta["shared_blks_read"])
                                            if {"shared_blks_hit", "shared_blks_read"} <= delta.keys() else None)
+            # Logical buffer accesses track CPU/memory-bandwidth cost even when every access is a hit.
+            result["shared_blks_accessed"] = (delta["shared_blks_hit"] + delta["shared_blks_read"]
+                                              if {"shared_blks_hit", "shared_blks_read"} <= delta.keys() else None)
+            result["toplevel"] = current.get("toplevel")
         if name == "table_io":
             result["heap_hit_ratio"] = (ratio(delta["heap_blks_hit"], delta["heap_blks_hit"] + delta["heap_blks_read"])
                                         if {"heap_blks_hit", "heap_blks_read"} <= delta.keys() else None)
         if name == "tables":
             result["hot_update_ratio"] = ratio(delta.get("n_tup_hot_upd"), delta.get("n_tup_upd"))
+        if name == "database":
+            # active_time is milliseconds spent executing; per wall-clock second it is average active sessions.
+            result["average_active_sessions"] = (delta["active_time"] / 1000 / elapsed
+                                                 if "active_time" in delta else None)
+            result["idle_in_transaction_share"] = ratio(delta.get("idle_in_transaction_time"), delta.get("session_time"))
+            result["rollback_ratio"] = (ratio(delta["xact_rollback"], delta["xact_commit"] + delta["xact_rollback"])
+                                        if {"xact_commit", "xact_rollback"} <= delta.keys() else None)
         output.append(result)
     for reason, count in sorted(excluded.items()):
         warnings.append(f"{name}: excluded {count} row(s): {reason}")
     return output
+
+
+def xmin_horizon_holders(snapshot):
+    """Who keeps VACUUM from removing dead rows, oldest first. Sessions are limited to this DB."""
+    holders = []
+    for row in rows(snapshot, "activity"):
+        ages = [row[k] for k in ("backend_xid_age", "backend_xmin_age") if numeric(row.get(k))]
+        if ages:
+            holders.append({"source": "session", "scope": "this database", "age": max(ages), "pid": row.get("pid"),
+                            "backend_type": row.get("backend_type"), "state": row.get("state"),
+                            "xact_start": row.get("xact_start")})
+    for row in rows(snapshot, "prepared"):
+        if numeric(row.get("transaction_age")):
+            holders.append({"source": "prepared_transaction", "scope": "this database", "age": row["transaction_age"],
+                            "gid": row.get("gid"), "prepared": row.get("prepared")})
+    for row in rows(snapshot, "slots"):
+        for field, source, scope in (("xmin_age", "replication_slot_xmin", "cluster"),
+                                     ("catalog_xmin_age", "replication_slot_catalog_xmin", "system catalogs")):
+            if numeric(row.get(field)):
+                holders.append({"source": source, "scope": scope, "age": row[field],
+                                "slot_name": row.get("slot_name"), "active": row.get("active")})
+    for row in rows(snapshot, "replication"):
+        if numeric(row.get("backend_xmin_age")):
+            holders.append({"source": "standby_feedback", "scope": "cluster", "age": row["backend_xmin_age"],
+                            "pid": row.get("pid"), "application_name": row.get("application_name")})
+    return sorted(holders, key=lambda x: x["age"], reverse=True)
+
+
+def redundant_indexes(indexes):
+    """B-tree indexes whose keys equal or prefix another index on the same table."""
+    usable = []
+    for row in indexes:
+        count = row.get("indnkeyatts")
+        if (row.get("access_method") != "btree" or not isinstance(count, int) or count <= 0
+                or row.get("has_expressions") or row.get("is_partial") or row.get("indisvalid") is False
+                or row.get("relid") is None):
+            continue
+        # indclass/indcollation/indoption cover key columns only; indkey also lists INCLUDE columns.
+        vectors = [str(row.get(field) or "").split() for field in ("indkey", "indclass", "indcollation", "indoption")]
+        if any(len(vector) < count for vector in vectors):
+            continue
+        usable.append((row, list(zip(*(vector[:count] for vector in vectors)))))
+    found = []
+    for row, keys in usable:
+        # Unique/constraint indexes enforce rules, and INCLUDE columns may serve index-only scans.
+        if (row.get("indisunique") or row.get("indisprimary") or row.get("indisexclusion")
+                or row.get("constraint_names") or row.get("indnatts", row["indnkeyatts"]) != row["indnkeyatts"]):
+            continue
+        for other, other_keys in usable:
+            if other is row or other.get("relid") != row.get("relid") or other_keys[:len(keys)] != keys:
+                continue
+            duplicate = len(other_keys) == len(keys)
+            if duplicate and not other.get("indisunique") and (other.get("indexrelid") or 0) > (row.get("indexrelid") or 0):
+                continue  # Report only one member of an identical non-unique pair.
+            found.append({"schemaname": row.get("schemaname"), "relname": row.get("relname"),
+                          "index": row.get("indexrelname"), "covered_by": other.get("indexrelname"),
+                          "reason": "duplicate" if duplicate else "prefix", "index_bytes": row.get("index_bytes"),
+                          "idx_scan": row.get("idx_scan")})
+            break
+    return sorted(found, key=lambda x: x["index_bytes"] if numeric(x["index_bytes"]) else 0, reverse=True)
+
+
+def autovacuum_backlog(tables, values):
+    """Tables already past their autovacuum/autoanalyze trigger, using table reloptions over globals."""
+    def setting(options, name):
+        try:
+            return float(options[name] if name in options else values[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    found = []
+    for row in tables:
+        options = {}
+        for item in row.get("reloptions") or []:
+            if isinstance(item, str) and "=" in item:
+                key, value = item.split("=", 1)
+                if key in AUTOVACUUM_RELOPTIONS:
+                    options[key] = value
+        if row.get("relkind") == "p":
+            # Autovacuum never ANALYZEs partitioned parents; whole-table estimates need a manual ANALYZE.
+            if not row.get("last_analyze") and not row.get("last_autoanalyze"):
+                found.append({"schemaname": row.get("schemaname"), "relname": row.get("relname"),
+                              "reason": "partitioned_parent_never_analyzed", "ratio": None})
+            continue
+        if row.get("relkind") not in ("r", "m"):
+            continue
+        reltuples = max(row["reltuples"], 0) if numeric(row.get("reltuples")) else 0
+        enabled = (values.get("autovacuum") == "on"
+                   and options.get("autovacuum_enabled", "on").lower() not in ("off", "false", "no", "0"))
+        entry = {"schemaname": row.get("schemaname"), "relname": row.get("relname"), "autovacuum_enabled": enabled,
+                 "last_autovacuum": row.get("last_autovacuum"), "last_autoanalyze": row.get("last_autoanalyze")}
+        base, scale = setting(options, "autovacuum_vacuum_threshold"), setting(options, "autovacuum_vacuum_scale_factor")
+        if base is not None and scale is not None and numeric(row.get("n_dead_tup")):
+            threshold = base + scale * reltuples
+            cap = setting(options, "autovacuum_vacuum_max_threshold")
+            if cap is not None and cap >= 0:
+                threshold = min(threshold, cap)
+            entry.update(n_dead_tup=row["n_dead_tup"], dead_threshold=threshold,
+                         dead_ratio=ratio(row["n_dead_tup"], threshold))
+        base = setting(options, "autovacuum_vacuum_insert_threshold")
+        scale = setting(options, "autovacuum_vacuum_insert_scale_factor")
+        if base is not None and base >= 0 and scale is not None and numeric(row.get("n_ins_since_vacuum")):
+            # Approximate: PostgreSQL 18+ scales this term by the unfrozen fraction of the table.
+            threshold = base + scale * reltuples
+            entry.update(n_ins_since_vacuum=row["n_ins_since_vacuum"], insert_threshold=threshold,
+                         insert_ratio=ratio(row["n_ins_since_vacuum"], threshold))
+        base, scale = setting(options, "autovacuum_analyze_threshold"), setting(options, "autovacuum_analyze_scale_factor")
+        if base is not None and scale is not None and numeric(row.get("n_mod_since_analyze")):
+            threshold = base + scale * reltuples
+            entry.update(n_mod_since_analyze=row["n_mod_since_analyze"], analyze_threshold=threshold,
+                         analyze_ratio=ratio(row["n_mod_since_analyze"], threshold))
+        ratios = [entry.get(k) for k in ("dead_ratio", "insert_ratio", "analyze_ratio") if numeric(entry.get(k))]
+        if ratios and max(ratios) > 1:
+            entry.update(reason="past_trigger_threshold", ratio=max(ratios))
+            found.append(entry)
+    return sorted(found, key=lambda x: (x["ratio"] is not None, x["ratio"] or 0), reverse=True)
 
 
 def analyze(before, after, top=10):
@@ -241,8 +379,16 @@ def analyze(before, after, top=10):
         selected = sorted((x for x in items if numeric(metric(x)) and metric(x) > 0), key=metric, reverse=True)[:top]
         return [dict(x, ranking_value=metric(x)) for x in selected]
     sql = deltas["pgss"]
+    # With track=all, nested statements are also inside their caller's time: share only top-level work.
+    toplevel_total = sum(x["delta"].get("total_exec_time", 0) for x in sql if x.get("toplevel") is not False)
+    for entry in sql:
+        entry["exec_time_share"] = (ratio(entry["delta"].get("total_exec_time"), toplevel_total)
+                                    if entry.get("toplevel") is not False else None)
     rankings = {
         "sql_total_exec_ms": rank(sql, lambda x: x["delta"].get("total_exec_time")),
+        "sql_total_plan_ms": rank(sql, lambda x: x["delta"].get("total_plan_time")),
+        "sql_shared_blks_accessed": rank(sql, lambda x: x.get("shared_blks_accessed")),
+        "sql_wal_bytes": rank(sql, lambda x: x["delta"].get("wal_bytes")),
         "sql_mean_exec_ms": rank(sql, lambda x: x.get("mean_exec_ms")),
         "sql_calls": rank(sql, lambda x: x["delta"].get("calls")),
         "sql_temp_written_bytes": rank(sql, lambda x: x.get("temp_written_bytes")),
@@ -256,20 +402,25 @@ def analyze(before, after, top=10):
     gauge_keys = {
         "tables": ("relid", "schemaname", "relname", "n_live_tup", "n_dead_tup", "n_mod_since_analyze",
                    "last_autovacuum", "last_autoanalyze", "xid_age", "mxid_age", "total_bytes", "reloptions"),
-        "activity": ("pid", "backend_start", "datname", "state", "xact_start", "query_start", "wait_event_type",
-                     "wait_event", "query_id", "backend_xmin", "leader_pid", "backend_type"),
+        "activity": ("pid", "backend_start", "datname", "state", "xact_start", "query_start", "state_change",
+                     "wait_event_type", "wait_event", "query_id", "backend_xmin", "backend_xmin_age",
+                     "leader_pid", "backend_type"),
         "locks": ("pid", "locktype", "mode", "granted", "waitstart", "blocking_pids", "relation_schema",
                   "relation_name", "transactionid", "xact_start", "state"),
         "slots": ("slot_name", "slot_type", "database", "active", "restart_lsn", "confirmed_flush_lsn",
-                  "xmin", "catalog_xmin", "wal_status", "safe_wal_size", "retained_wal_bytes", "in_recovery"),
+                  "xmin", "catalog_xmin", "xmin_age", "catalog_xmin_age", "wal_status", "safe_wal_size",
+                  "retained_wal_bytes", "in_recovery"),
         "replication": ("pid", "state", "sync_state", "sent_lsn", "write_lsn", "flush_lsn", "replay_lsn",
-                        "write_lag", "flush_lag", "replay_lag"),
-        "prepared": ("transaction", "gid", "prepared", "database"),
+                        "write_lag", "flush_lag", "replay_lag", "backend_xmin_age"),
+        "prepared": ("transaction", "transaction_age", "gid", "prepared", "database"),
     }
     for name, fields in gauge_keys.items():
         data = rows(after, name)
         if name == "tables":
             data = sorted(data, key=lambda x: x.get("n_dead_tup") or 0, reverse=True)
+        if name == "activity":
+            # Oldest transactions first: they matter most for locks and VACUUM, and pid order would hide them.
+            data = sorted(data, key=lambda x: (x.get("xact_start") is None, x.get("xact_start") or ""))
         if name == "locks":
             data = [x for x in data if x.get("blocking_pids") or x.get("granted") is False]
         if len(data) > top:
@@ -278,6 +429,9 @@ def analyze(before, after, top=10):
         section = after.get("sections", {}).get(name, {})
         if section.get("status") != "ok" or section.get("truncated"):
             warnings.append(f"current {name}: missing or truncated evidence")
+    current["xmin_horizon_holders"] = xmin_horizon_holders(after)[:top]
+    current["redundant_indexes"] = redundant_indexes(rows(after, "indexes"))[:top]
+    current["autovacuum_backlog"] = autovacuum_backlog(rows(after, "tables"), settings(after))[:top]
     return {"schema_version": 1, "instance_id": after["instance_id"], "database": after["metadata"]["database"],
             "window": {"from": before["started_at"], "to": after["finished_at"],
                        "note": "Overall collection bounds; use each section's elapsed_seconds for interval rates."},
@@ -294,7 +448,7 @@ def render_markdown(report):
              "Rankings identify candidates. An empty list is not a clean bill of health.", "", "## Data quality", ""]
     lines += ["- " + value for value in report["warnings"]] or ["- No detected discontinuity; see limitations."]
     for group, entries in report["rankings"].items():
-        lines += ["", "## " + group, "", "| Identity | Ranking value | calls | total ms | mean ms | rows/call | temp bytes | read bytes |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        lines += ["", "## " + group, "", "| Identity | Ranking value | share | calls | total ms | mean ms | rows/call | temp bytes | read bytes |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for entry in entries:
             def cell(value):
                 if value is None:
@@ -302,7 +456,8 @@ def render_markdown(report):
                 if isinstance(value, float):
                     return f"{value:.3f}"
                 return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
-            values = [json.dumps(entry["identity"], ensure_ascii=False), entry["ranking_value"], entry["delta"].get("calls"),
+            values = [json.dumps(entry["identity"], ensure_ascii=False), entry["ranking_value"], entry.get("exec_time_share"),
+                      entry["delta"].get("calls"),
                       entry["delta"].get("total_exec_time"), entry.get("mean_exec_ms"), entry.get("rows_per_call"),
                       entry.get("temp_written_bytes"), entry.get("shared_read_bytes")]
             lines.append("| " + " | ".join(cell(value) for value in values) + " |")

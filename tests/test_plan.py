@@ -93,6 +93,34 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(report["nodes"][0]["metrics"]["Local I/O Write Time"], 2.1)
         self.assertEqual([item["kind"] for item in report["candidates"]], ["incremental_sort_spill"])
 
+    def test_nested_loop_filtering_counts_all_loops(self):
+        raw = {"Plan": {"Node Type": "Seq Scan", "Plan Rows": 1, "Actual Rows": 1, "Actual Loops": 5000,
+                        "Rows Removed by Filter": 100}}
+        kinds = [c["kind"] for c in MODULE.analyze(raw)["plans"][0]["candidates"]]
+        self.assertIn("heavy_filtering", kinds)
+        self.assertIn("repeated_seq_scan", kinds)
+
+    def test_self_time_hotspots(self):
+        raw = {"Plan": {"Node Type": "Hash Join", "Actual Total Time": 100, "Actual Loops": 1, "Plans": [
+                   {"Node Type": "Seq Scan", "Relation Name": "big", "Actual Total Time": 70, "Actual Loops": 1},
+                   {"Node Type": "Hash", "Actual Total Time": 20, "Actual Loops": 1, "Plans": [
+                       {"Node Type": "Index Scan", "Actual Total Time": 0.05, "Actual Loops": 200}]}]},
+               "Execution Time": 100}
+        spots = MODULE.analyze(raw)["plans"][0]["hotspots"]
+        self.assertEqual((spots[0]["relation"], spots[0]["self_ms_approx"]), ("big", 70))
+        self.assertAlmostEqual(spots[0]["share_of_execution"], .7)
+        hash_node = next(x for x in spots if x["node_type"] == "Hash")
+        self.assertAlmostEqual(hash_node["self_ms_approx"], 10)
+        self.assertIn("Self-time hotspots", MODULE.markdown(MODULE.analyze(raw)))
+
+    def test_lossy_bitmap_planning_and_jit_candidates(self):
+        raw = {"Plan": {"Node Type": "Bitmap Heap Scan", "Plan Rows": 10, "Actual Rows": 10, "Actual Loops": 1,
+                        "Exact Heap Blocks": 5, "Lossy Heap Blocks": 900, "Rows Removed by Index Recheck": 5000},
+               "Planning Time": 80, "Execution Time": 40,
+               "JIT": {"Functions": 4, "Timing": {"Total": 30}}}
+        kinds = {c["kind"] for c in MODULE.analyze(raw)["plans"][0]["candidates"]}
+        self.assertEqual(kinds, {"lossy_bitmap", "planning_dominates", "jit_overhead"})
+
     def test_invalid_structure_rejected(self):
         for data in ([], {}, {"Plan": []}, [{"wrong": True}], {"Plan": {"Node Type": "Scan", "Plans": {}}}):
             with self.assertRaises(ValueError):

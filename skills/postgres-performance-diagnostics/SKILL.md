@@ -1,6 +1,6 @@
 ---
 name: postgres-performance-diagnostics
-description: Diagnose PostgreSQL 18 and 19 performance using cumulative statistics, execution plans, and logs. Use for slow queries, I/O, spills, locking, index design, excessive calls, vacuum, WAL, replication, and resource contention; produce evidence-backed candidates and validation plans.
+description: Diagnose PostgreSQL 18 and 19 performance using wait-event sampling, cumulative statistics, execution plans, and logs. Use for slow queries, high CPU, wait events, I/O, spills, locking, index design (missing or redundant), excessive calls, vacuum backlog, WAL, replication, and resource contention; produce evidence-backed candidates and validation plans.
 ---
 
 # PostgreSQLの性能診断
@@ -17,10 +17,22 @@ description: Diagnose PostgreSQL 18 and 19 performance using cumulative statisti
 
 2026-10-26の公式19ドキュメントはRC1。19を正式版と決めつけず、実ビルドと検証結果を報告する。
 
+## 最初の切り分け
+
+上から順に、時間を使っている場所へ絞り込む。個別の指標から始めない。
+
+1. **DB時間の内訳**: 症状が出ている間に`scripts/sample_activity.py`で待機をサンプリングする。平均アクティブセッション数とCPU・I/O・Lock・LWLock等の割合から、読む手順を選ぶ。[wait-events.md](references/wait-events.md)
+2. **SQLの負荷シェア**: `analyze.py`の`exec_time_share`と`sql_total_exec_ms`で、区間のtop-level実行時間の大半を占めるSQLを特定する。短いSQLは`sql_calls`、CPU負荷は`sql_shared_blks_accessed`、更新負荷は`sql_wal_bytes`で見る。
+3. **計画のホットスポット**: 対象SQLのJSON計画を`analyze_plan.py`に通し、`hotspots`の自己時間が大きいノードから候補を確認する。
+4. **保守の詰まり**: `current`の`xmin_horizon_holders`、`autovacuum_backlog`、`redundant_indexes`は1時点の規則ベースの候補。定義と設定を確認してから扱う。
+
+症状が既に絞られていれば（特定APIだけ遅い、ロック待ちのアラート等）、該当する手順から始めてよい。
+
 ## 症状に応じて読む
 
 | 症状・目的 | 手順 | 主な追加入力 |
 | --- | --- | --- |
+| 全体が遅い、原因の当たりがない、CPU・待機の内訳 | [wait-events.md](references/wait-events.md) | 症状中の待機サンプル、CPUコア数 |
 | 遅いSQL、非効率なスキャン、JOIN／ORDER BY索引、計画退行 | [query-tuning.md](references/query-tuning.md) | SQL・代表パラメータ・DDL・JSON計画・分布 |
 | 大量行取得、短いSQLの大量実行、N+1 | [query-tuning.md](references/query-tuning.md#大量取得とn1) | リクエスト単位のtrace、ORM呼出箇所、転送量 |
 | 低ヒット率、I/O待ち、temp落ち、CPU・メモリ・接続競合 | [io-memory.md](references/io-memory.md) | OS／ストレージ指標、同時実行数、pool待ち |
@@ -40,6 +52,8 @@ description: Diagnose PostgreSQL 18 and 19 performance using cumulative statisti
 ## 実行と変更の境界
 
 付属の収集は読み取りを基本とし、タイムアウトと行数上限を使う。EXPLAIN ANALYZEは対象SQLを実行する。取得済み計画・通常EXPLAINで足りるか検討し、実測が必要なら負荷・副作用を評価して対象と時間を限定する。ROLLBACKでシーケンスや外部への副作用まで必ず戻せるとは扱わない。
+
+原因が設定値（メモリ配分、checkpoint、autovacuum、プランナのコスト等）にあると判断したら、`postgres-config-tuning`スキルが利用可能ならそれで変更案・適用・検証を具体化する。区間レポートのJSONをその根拠として渡す。
 
 拡張の導入は可能。必要性、提供環境の対応、権限、再起動／負荷、代替手段を確認して、対象環境で許可された範囲で行う。DDL、設定変更、再起動、セッション終了は診断結果とは分けて具体的な変更案にし、既に与えられた実行権限の範囲を守る。
 

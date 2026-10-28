@@ -17,7 +17,9 @@ activity、locks、prepared transactionsのsnapshotを使う。発生中なら�
 
 並列workerのleader、DDL、advisory lock、待機列の先行者も考慮する。activityに「現在のSQL」が見えても、そのSQLが保持中の全ロックを取得したとは限らない。トランザクションの過去の更新順序をアプリtraceと照合する。
 
-ロック待ちを作っていない古いsnapshotもVACUUMを妨げ得る。[保守の手順](maintenance-replication.md)へ進む。
+断続的なロック待ちは1回のsnapshotで捉えにくい。`scripts/sample_activity.py`で症状の時間帯をサンプリングすると、`lock_blockers`にblockerのPIDと待機者の観測回数が残る。[wait-events.md](wait-events.md)を参照。
+
+`analyze.py`の`current.activity`はトランザクション開始の古い順に並ぶ。ロック待ちを作っていない古いsnapshotもVACUUMを妨げ得る。`xmin_horizon_holders`と[保守の手順](maintenance-replication.md)へ進む。
 
 ## deadlockと過去の待機
 
@@ -28,6 +30,8 @@ deadlock件数は傾向であり、原因となるSQLの一覧ではない。SQL
 ## 対処と再発防止
 
 根本blockerの業務上の役割、トランザクションの更新量、ロールバック時間を確認する。必要に応じてトランザクション短縮、更新順序統一、SQL／索引改善、適切なtimeout、アプリ再試行を提案する。再試行はトランザクション単位の整合性と冪等性を評価する。
+
+DDLの`ACCESS EXCLUSIVE`待ちは、後から来た通常のSELECT／DMLもその後ろに並ばせる。長いトランザクションがある間のDDLは、短い`lock_timeout`を設定して再試行する手順を提案する。再発防止の安全網として、`idle_in_transaction_session_timeout`や`transaction_timeout`（PostgreSQL 17以降）をロール・アプリ単位で検討する。全体に設定すると正当な長時間処理やバッチも切断するため、対象と値を業務要件から決める。
 
 `pg_cancel_backend`は現在のクエリのキャンセルであり、idle in transactionの保持ロックを必ず解消する方法ではない。`pg_terminate_backend`は接続と進行中トランザクションへ影響する。必要な操作を具体化し、対象環境で許可された範囲で実行する。診断スクリプトはこれらを実行しない。
 

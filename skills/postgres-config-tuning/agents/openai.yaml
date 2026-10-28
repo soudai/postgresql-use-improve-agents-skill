@@ -1,0 +1,4 @@
+interface:
+  display_name: "PostgreSQL設定最適化"
+  short_description: "ハードウェア・ワークロード・観測結果からPostgreSQLの設定変更案と検証手順を作る"
+  default_prompt: "$postgres-config-tuning を使い、PostgreSQLの設定を環境と根拠に基づいて見直し、変更案と検証・切り戻し手順を示してください。"

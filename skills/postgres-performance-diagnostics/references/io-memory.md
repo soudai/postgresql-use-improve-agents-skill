@@ -36,6 +36,8 @@ Sortのdisk使用、Hashの複数batch、集約やJOINの中間結果を調べ�
 
 DB内実行、lock／I/O待ち、pool待ち、接続確立、ネットワーク、結果受信・変換を分ける。pool待ちのリクエストはDBのactivityにまだ現れない場合がある。
 
+CPU・I/O・LWLockのどこに時間を使っているかは、まず[待機のサンプリング](wait-events.md)で内訳を取る。CPUの割合が高ければ、`analyze.py`の`sql_shared_blks_accessed`（ヒットを含む論理読み取り）で上位のSQLを探す。ヒット率が高くても論理読み取りが多ければCPUを消費する。
+
 `active`かつwait_eventがNULLというだけでCPU稼働を確定しない。SQL実行時間はCPU時間ではない。OSのプロセス別CPU、RSS、swap、OOM、cgroup／クラウド制限と同時刻で突き合わせる。
 
 接続数と生成速度、active率、poolの上限・待ち時間、長いトランザクション、parallel workers planned/launched、worker上限を確認する。同時実行数の制御、pool調整、処理時間帯の分散、SQL改善、資源増強を比較し、`max_connections`・メモリ・parallel workerの一律増量を既定策にしない。

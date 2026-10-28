@@ -5,9 +5,10 @@ PostgreSQL 18・19の統計情報、実行計画、ログを使い、改善す�
 ## 内容
 
 - `skills/postgres-performance-diagnostics/SKILL.md`: エージェントの入口と調査の分岐。
-- `references/`: SQL・索引、I/O・メモリ、ロック、保守・レプリケーションの診断手順。
+- `references/`: 待機イベント、SQL・索引、I/O・メモリ、ロック、保守・レプリケーションの診断手順。
 - `sql/`: 読み取り用の収集SQLと、その依存ビューを記録するマニフェスト。
-- `scripts/`: スナップショット収集、区間差分、実行計画、JSONログの解析。
+- `scripts/`: スナップショット収集、待機サンプリング、区間差分、実行計画、JSONログの解析。
+- `skills/postgres-config-tuning/`: 設定（postgresql.conf・ロール単位・parameter group）の見直しと変更計画を作る別スキル。
 
 統計から出せるのは調査候補です。Seq Scan、低ヒット率、高い実行回数だけで異常とは判定せず、実行計画やアプリの情報で原因を確認します。DDL・設定変更・セッション終了を自動適用するツールではありません。
 
@@ -58,6 +59,18 @@ python skills/postgres-performance-diagnostics/scripts/analyze.py snapshots/befo
 
 SQL本文は収集時の`--include-query-text`指定時だけ含めます。本文を含めない場合も、relation名、ユーザー名、application_name等は機密情報になり得ます。出力は権限を限定した場所に保存してください。`snapshots/`と`reports/`はGitの対象外です。
 
+区間レポートには、top-level実行時間に占める割合（`exec_time_share`）、論理読み取り・WAL量・計画時間の順位、DB単位の平均アクティブセッション数に加え、時点の候補として`xmin_horizon_holders`（VACUUMの回収を止めている保持元）、`redundant_indexes`（重複・先頭一致の索引）、`autovacuum_backlog`（起動閾値を超えたテーブル）が含まれます。
+
+## 待機をサンプリングする
+
+累積統計では、時間がCPU・I/O・ロックのどこで使われたかは分かりません。症状が出ている間に`pg_stat_activity`をサンプリングし、待機の内訳とquery_idごとの割合を集計します。
+
+```powershell
+python skills/postgres-performance-diagnostics/scripts/sample_activity.py --instance-id prod-primary --samples 120 --interval 1 --format markdown --output reports/waits.md
+```
+
+1つの接続で読み取りSELECTと`pg_sleep`を交互に実行します。SQL本文は取得しません。解釈は[待機イベント](skills/postgres-performance-diagnostics/references/wait-events.md)を参照してください。
+
 取得項目、拡張導入、権限、タイムアウト、収集上限については[収集手順](skills/postgres-performance-diagnostics/references/collection.md)を参照してください。スクリプトの正確な引数は各`--help`でも確認できます。
 
 ## 計画とログを解析する
@@ -70,6 +83,17 @@ python skills/postgres-performance-diagnostics/scripts/analyze_logs.py postgresq
 `plan.json`はJSON形式のEXPLAIN出力です。ログ解析はPostgreSQLの`jsonlog`を対象とします。`--format`の既定はMarkdownです。式やSQL・ログ本文まで出力する場合は`--include-details`を指定します。EXPLAIN ANALYZEはSQLを実際に実行するため、まず取得済みの計画を使い、追加実行が必要なときは対象・負荷・副作用を評価します。詳しくは[クエリ診断](skills/postgres-performance-diagnostics/references/query-tuning.md)を参照してください。
 
 自動解析は候補抽出を補助します。計画解析は全ての最適化を網羅せず、ログのtemp・duration等のメッセージ解析は英語形式を対象とします。deadlockはSQLSTATEでも判別します。未分類ログや部分採取がある場合は、解析結果の制限事項を確認してください。
+
+## 設定を最適化する
+
+`skills/postgres-config-tuning`は、ハードウェア・ワークロード・観測結果から設定の変更案を作る別スキルです。診断スキルと同様にフォルダごと配置します。現在の設定は`pg_settings`全体を、資格情報・コマンド・パスを伏せてJSONで取得します。
+
+```powershell
+psql -X -qAt --file skills/postgres-config-tuning/sql/settings.sql > settings.json
+python skills/postgres-config-tuning/scripts/review_config.py settings.json --ram-gb 64 --cpus 16 --storage ssd --workload oltp --max-active-connections 80 --interval-report reports/interval.json --output reports/config.md
+```
+
+`--interval-report`には診断スキルの`analyze.py --format json`の出力を渡し、checkpointの要求比率、WAL量、temp量、JIT時間を根拠にします。メモリ・CPU・ストレージを指定しない項目は推測せず「評価対象外」として出力します。managed serviceでは`--managed`を指定します。設定は変更せず、反映方法・検証・切り戻しは[適用と検証](skills/postgres-config-tuning/references/apply-and-verify.md)にまとめています。
 
 ## 診断とIssueの対応
 
@@ -106,4 +130,4 @@ python tests/integration.py --image postgres:19rc1-bookworm
 
 テストは新しい使い捨てコンテナを作り、合成データと`pg_stat_statements`を使います。ホストのポート・データディレクトリは公開／マウントせず、コンテナのネットワークを無効化します。テスト自身が作ったコンテナだけを識別して終了時に削除します。スクリプトはイメージを自動取得しません。
 
-2026-10-26の検証では、ユニットテスト55件、スキル形式の検証、PostgreSQL 18.6／19rc1の統合テストが成功しました。合成データでの収集・解析・誤比較の防止を確認した結果であり、本番負荷での性能改善や、全Issueの完了条件を満たしたという意味ではありません。実レプリケーション構成、実際のdeadlock、managed cloud環境は未検証です。[検証範囲](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。
+2026-10-26の検証では、ユニットテスト55件、スキル形式の検証、PostgreSQL 18.6／19rc1の統合テストが成功しました。合成データでの収集・解析・誤比較の防止を確認した結果であり、本番負荷での性能改善や、全Issueの完了条件を満たしたという意味ではありません。2026-10-28に追加した待機サンプリングと設定最適化スキルは、ユニットテスト80件と18.6／19rc1の統合テストで確認しました。実レプリケーション構成、実際のdeadlock、managed cloud環境は未検証です。[検証範囲](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。

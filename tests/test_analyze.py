@@ -190,6 +190,82 @@ class IntervalTests(unittest.TestCase):
             self.assertEqual(report["deltas"]["pgss"], [])
             self.assertTrue(any("SQL interval suppressed" in x for x in report["warnings"]))
 
+    def test_exec_share_and_logical_reads_ranking(self):
+        report = MODULE.analyze(*pair())
+        entry = report["rankings"]["sql_shared_blks_accessed"][0]
+        self.assertEqual(entry["shared_blks_accessed"], 10)
+        self.assertEqual(entry["exec_time_share"], 1)
+
+    def test_nested_statements_are_not_in_share_denominator(self):
+        a, b = pair()
+        for snap in (a, b):
+            nested = copy.deepcopy(snap["sections"]["pgss"]["rows"][0])
+            nested.update(toplevel=False, queryid=1)
+            snap["sections"]["pgss"]["rows"].append(nested)
+        shares = {x["toplevel"]: x["exec_time_share"] for x in MODULE.analyze(a, b)["deltas"]["pgss"]}
+        self.assertEqual(shares, {True: 1, False: None})
+
+    def test_database_average_active_sessions(self):
+        a, b = pair()
+        for snap, ms in ((a, 0), (b, 30000)):
+            snap["sections"]["database"]["rows"][0].update(active_time=ms, session_time=ms * 4,
+                                                           idle_in_transaction_time=ms)
+        entry = MODULE.analyze(a, b)["deltas"]["database"][0]
+        self.assertEqual(entry["average_active_sessions"], .5)
+        self.assertEqual(entry["idle_in_transaction_share"], .25)
+
+    def test_activity_oldest_transaction_first_and_xmin_holders(self):
+        a, b = pair()
+        b["sections"]["activity"] = {"status": "ok", "rows": [
+            {"pid": 1, "xact_start": None, "backend_type": "checkpointer"},
+            {"pid": 2, "xact_start": "2026-10-26T00:00:50+00:00", "backend_xmin_age": 10},
+            {"pid": 3, "xact_start": "2026-10-25T00:00:00+00:00", "backend_xmin_age": 9000}]}
+        b["sections"]["slots"] = {"status": "ok", "rows": [{"slot_name": "s", "catalog_xmin_age": 50000, "xmin_age": None}]}
+        b["sections"]["prepared"] = {"status": "ok", "rows": [{"gid": "g", "transaction_age": 100}]}
+        current = MODULE.analyze(a, b, top=2)["current"]
+        self.assertEqual([x["pid"] for x in current["activity"]], [3, 2])
+        self.assertEqual([x["source"] for x in current["xmin_horizon_holders"]],
+                         ["replication_slot_catalog_xmin", "session"])
+
+    def test_redundant_index_candidates_respect_constraints(self):
+        def index(oid, name, keys, **extra):
+            count = len(keys.split())
+            row = {"relid": 1, "indexrelid": oid, "indexrelname": name, "access_method": "btree",
+                   "indnkeyatts": count, "indnatts": count, "indkey": keys, "indclass": " ".join(["3124"] * count),
+                   "indcollation": " ".join(["0"] * count), "indoption": " ".join(["0"] * count),
+                   "has_expressions": False, "is_partial": False, "indisvalid": True, "constraint_names": [],
+                   "index_bytes": oid * 100}
+            row.update(extra)
+            return row
+        indexes = [index(10, "pk", "1", indisunique=True, indisprimary=True, constraint_names=["pk"]),
+                   index(11, "pk_dup", "1"),
+                   index(12, "a", "2"), index(13, "a_b", "2 3"), index(14, "a_b_copy", "2 3"),
+                   index(15, "c_expr", "4", has_expressions=True), index(16, "c_d", "4 5"),
+                   index(17, "e_incl", "6 7", indnkeyatts=1, indclass="3124", indcollation="0", indoption="0"),
+                   index(18, "e_f", "6 8"),
+                   index(19, "g_desc", "9", indoption="3"), index(20, "g_h", "9 10")]
+        found = {(x["index"], x["covered_by"], x["reason"]) for x in MODULE.redundant_indexes(indexes)}
+        self.assertEqual(found, {("pk_dup", "pk", "duplicate"), ("a", "a_b", "prefix"),
+                                 ("a_b_copy", "a_b", "duplicate")})
+
+    def test_autovacuum_backlog_uses_reloptions_and_flags_partition_parents(self):
+        values = {"autovacuum": "on", "autovacuum_vacuum_threshold": "50", "autovacuum_vacuum_scale_factor": "0.2",
+                  "autovacuum_vacuum_max_threshold": "100000000", "autovacuum_analyze_threshold": "50",
+                  "autovacuum_analyze_scale_factor": "0.1"}
+        tables = [{"relname": "hot", "relkind": "r", "reltuples": 1000, "n_dead_tup": 500, "n_mod_since_analyze": 0},
+                  {"relname": "tuned", "relkind": "r", "reltuples": 1000, "n_dead_tup": 500, "n_mod_since_analyze": 0,
+                   "reloptions": ["autovacuum_vacuum_scale_factor=0.5", "fillfactor=90"]},
+                  {"relname": "fresh", "relkind": "r", "reltuples": -1, "n_dead_tup": 10, "n_mod_since_analyze": 0},
+                  {"relname": "parent", "relkind": "p", "last_analyze": None},
+                  {"relname": "off", "relkind": "r", "reltuples": 0, "n_dead_tup": 100, "n_mod_since_analyze": 0,
+                   "reloptions": ["autovacuum_enabled=false"]}]
+        found = {x["relname"]: x for x in MODULE.autovacuum_backlog(tables, values)}
+        self.assertEqual(set(found), {"hot", "parent", "off"})
+        self.assertEqual(found["hot"]["dead_threshold"], 250)
+        self.assertEqual(found["hot"]["dead_ratio"], 2)
+        self.assertFalse(found["off"]["autovacuum_enabled"])
+        self.assertEqual(found["parent"]["reason"], "partitioned_parent_never_analyzed")
+
 
 if __name__ == "__main__":
     unittest.main()

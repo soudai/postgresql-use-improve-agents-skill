@@ -26,6 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "postgres-performance-diagnostics" / "scripts"
 FIXTURE = ROOT / "tests" / "fixtures" / "workload.sql"
 RELATION_SQL = SCRIPTS.parent / "sql" / "inspect_relation.sql"
+CONFIG_SQL = ROOT / "skills" / "postgres-config-tuning" / "sql" / "settings.sql"
+CONFIG_SCRIPT = ROOT / "skills" / "postgres-config-tuning" / "scripts" / "review_config.py"
 TASK_LABEL = "postgres-performance-diagnostics"
 OPTIONAL_SECTIONS = {"lock_stats", "autovacuum_scores", "recovery"}
 
@@ -164,6 +166,33 @@ def exercise(container, directory):
     assert compare(before_path, incompatible_path, directory / "invalid-report.json",
                    check=False).returncode != 0, "Different instances must be rejected"
 
+    assert all("backend_xmin_age" in row for row in after["sections"]["activity"]["rows"])
+    assert "xmin_horizon_holders" in report["current"] and "autovacuum_backlog" in report["current"]
+    # The fixture ANALYZEs the partitioned parent, so last_analyze must be reported for it.
+    assert not any(x.get("relname") == "events" for x in report["current"]["autovacuum_backlog"]), \
+        "A manually analyzed partitioned parent was flagged"
+
+    collected = {row["name"]: row["setting"] for row in after["sections"]["settings"]["rows"]}
+    assert collected["statement_timeout"] == "0", "The collector's own SET LOCAL leaked into settings"
+
+    export = run(["docker", "exec", "-i", container, "psql", "-X", "-qAt", "--no-password", "--file=-"],
+                 sql=CONFIG_SQL.read_text(encoding="utf-8")).stdout
+    settings = json.loads(export)
+    by_name = {row["name"]: row for row in settings["settings"]}
+    assert by_name["statement_timeout"]["setting"] == "0", "The export's own SET LOCAL leaked"
+    assert by_name["primary_conninfo"]["setting"] == "<redacted>"
+    settings_path = directory / "settings.json"
+    settings_path.write_text(export, encoding="utf-8")
+    review = run([sys.executable, str(CONFIG_SCRIPT), str(settings_path), "--ram-gb", "8", "--cpus", "4",
+                  "--storage", "ssd", "--interval-report", str(report_path), "--format", "json"]).stdout
+    assert any(f["parameter"] == "shared_buffers" for f in json.loads(review)["findings"])
+
+    samples_path = directory / "samples.json"
+    run([sys.executable, str(SCRIPTS / "sample_activity.py"), "--docker-container", container,
+         "--instance-id", container, "--samples", "3", "--interval", "0.2", "--output", str(samples_path)])
+    samples = json.loads(samples_path.read_text(encoding="utf-8"))
+    assert samples["summary"]["samples"] == 3 and samples["error"] is None, samples
+
     limited = collect(container, directory / "limited.json", row_limit=1)
     assert limited["sections"]["tables"]["truncated"], "Row limit did not mark truncation"
     assert limited["sections"]["pgss"]["truncated"], "SQL row limit did not mark truncation"
@@ -176,7 +205,8 @@ def exercise(container, directory):
             "checks": ["all available SQL", "non-public extension schema", "partition metadata",
                        "default SQL redaction", "interval counters", "temp spill",
                        "reset suppression", "instance rejection", "truncation",
-                       "targeted planner statistics", "quoted regclass input"]}
+                       "targeted planner statistics", "quoted regclass input",
+                       "xmin age columns", "activity sampling", "settings export and config review"]}
 
 
 def main(argv=None):
@@ -205,7 +235,8 @@ def main(argv=None):
         assert not details["HostConfig"].get("PortBindings")
         deadline = time.monotonic() + 60
         while True:
-            ready = run(["docker", "exec", name, "psql", "-X", "-qAt", "--no-password",
+            # The entrypoint's temporary init server listens on the socket only; TCP means the final server.
+            ready = run(["docker", "exec", name, "psql", "-h", "127.0.0.1", "-X", "-qAt", "--no-password",
                          "-c", "SELECT current_setting('shared_preload_libraries')"],
                         timeout=10, check=False)
             if ready.returncode == 0 and "pg_stat_statements" in ready.stdout:

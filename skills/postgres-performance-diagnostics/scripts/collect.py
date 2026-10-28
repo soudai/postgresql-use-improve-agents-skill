@@ -21,19 +21,25 @@ SETTINGS = (
     "max_parallel_maintenance_workers", "autovacuum", "autovacuum_max_workers",
     "autovacuum_naptime", "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
     "autovacuum_analyze_threshold", "autovacuum_analyze_scale_factor",
-    "autovacuum_freeze_max_age", "autovacuum_multixact_freeze_max_age",
+    "autovacuum_vacuum_insert_threshold", "autovacuum_vacuum_insert_scale_factor",
+    "autovacuum_vacuum_max_threshold", "autovacuum_worker_slots", "vacuum_cost_limit",
+    "vacuum_buffer_usage_limit", "autovacuum_freeze_max_age","autovacuum_multixact_freeze_max_age",
     "vacuum_freeze_table_age", "vacuum_multixact_freeze_table_age",
     "autovacuum_vacuum_cost_delay", "autovacuum_vacuum_cost_limit",
     "checkpoint_timeout", "checkpoint_completion_target", "max_wal_size", "min_wal_size",
     "wal_level", "wal_compression", "fsync", "full_page_writes", "synchronous_commit",
     "max_slot_wal_keep_size", "hot_standby_feedback", "max_standby_streaming_delay",
+    "wal_buffers", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
+    "transaction_timeout", "max_locks_per_transaction", "max_prepared_transactions",
+    "temp_file_limit", "huge_pages", "track_activity_query_size",
     "random_page_cost", "seq_page_cost", "effective_io_concurrency", "io_method",
+    "io_workers", "io_combine_limit", "maintenance_io_concurrency",
     "plan_cache_mode", "default_statistics_target", "jit", "jit_above_cost",
     "log_min_duration_statement", "log_min_duration_sample", "log_statement_sample_rate",
     "log_temp_files", "log_lock_waits", "deadlock_timeout", "log_autovacuum_min_duration",
     "log_checkpoints", "log_destination", "logging_collector", "shared_preload_libraries",
     "pg_stat_statements.track", "pg_stat_statements.track_planning", "pg_stat_statements.max",
-    "pg_stat_statements.save", "auto_explain.log_min_duration", "auto_explain.sample_rate",
+    "pg_stat_statements.save", "pg_stat_statements.track_utility","auto_explain.log_min_duration", "auto_explain.sample_rate",
     "auto_explain.log_analyze", "auto_explain.log_timing", "auto_explain.log_buffers",
 )
 
@@ -144,8 +150,11 @@ def collect(args: argparse.Namespace) -> dict:
     extension = next((e for e in meta["extensions"] if e["name"] == "pg_stat_statements"), None)
     sections = {}
     names = ",".join("'" + name + "'" for name in SETTINGS)
+    # Psql.run SET LOCALs these; report the session default instead of the collector's own value.
     sections["settings"] = client.section(
-        "SELECT name, setting, unit, context, pending_restart FROM pg_settings "
+        "SELECT name, CASE WHEN name IN ('statement_timeout', 'lock_timeout', 'stats_fetch_consistency', "
+        "'search_path', 'timezone') THEN reset_val ELSE setting END AS setting, "
+        "unit, context, pending_restart FROM pg_settings "
         f"WHERE name IN ({names}) ORDER BY name"
     )
     manifest = json.loads((SQL_DIR / "queries.json").read_text(encoding="utf-8"))
