@@ -137,6 +137,15 @@ python tests/scenarios.py --image postgres:19rc1-bookworm --only 3 9 --report re
 
 `--only`で対象のIssue番号を絞れます。結果のJSONには、各確認項目の成否と、変更前後の計測値（実行時間、WAL量、HOT率等）が残ります。
 
+実ストレージのI/O待ち（#4・#12）を含めるには、Dockerホストで使い捨てPostgreSQLボリュームを支えるブロックデバイスを`--io-device`に指定します。cgroup v2のI/O制御が必要です。以下の`/dev/sda`は例です。
+
+```text
+docker run --pull=never --rm --network none --entrypoint findmnt postgres:18-bookworm -n -o SOURCE -T /var/lib/postgresql
+python tests/scenarios.py --image postgres:18-bookworm --only 4 9 12 --io-device /dev/sda --report reports/scenarios-18.json
+```
+
+OOM検証にはcgroup v2のメモリイベントも必要です。I/O検証はテストコンテナだけに読み取り帯域制限を設定し、実際に`PGDATA`のデバイスに適用されたことを確認します。`--io-device`の指定がない場合は、I/O待ちの実ストレージ検証をスキップしたことをJSONに記録します。
+
 テストは新しい使い捨てコンテナを作り、合成データと`pg_stat_statements`を使います。ホストのポート・データディレクトリは公開／マウントせず、コンテナのネットワークを無効化します。テスト自身が作ったコンテナだけを識別して終了時に削除します。スクリプトはイメージを自動取得しません。
 
-2026-10-26の検証では、ユニットテスト55件、スキル形式の検証、PostgreSQL 18.6／19rc1の統合テストが成功しました。合成データでの収集・解析・誤比較の防止を確認した結果であり、本番負荷での性能改善や、全Issueの完了条件を満たしたという意味ではありません。2026-10-28に追加した待機サンプリングと設定最適化スキルは、ユニットテスト80件と18.6／19rc1の統合テストで確認しました。同日、Issue #3〜#12のシナリオ80項目が18.6／19rc1で成功し（ユニットテストは89件）、実streaming standbyと実deadlockも確認しました。ストレージ遅延によるI/O待ちと、generic plan退行の大きな時間差は再現できていません。実レプリケーション構成、実際のdeadlock、managed cloud環境は未検証です。[検証範囲](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。
+PostgreSQL 18.6／19 RC1で実行した統合テストとシナリオの結果は[検証記録](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。

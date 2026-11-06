@@ -23,7 +23,7 @@ python scripts/sample_activity.py --instance-id prod-primary --samples 60 --inte
 | 項目 | 意味 |
 | --- | --- |
 | average_active_sessions | クライアント／parallel workerのactiveな数の平均。CPUコア数と比べる |
-| wait_profile | active時間の待機内訳。`CPU (no wait event)`は待機イベントのない実行 |
+| wait_profile | active時間の待機内訳。`No reported wait event`は計測された待機イベントがない状態。CPU使用はOS指標で確認する |
 | by_query_id | 時間を使っているquery_idと、その主な待機。`pg_stat_statements`のqueryidと照合する |
 | lock_blockers | ロック待ちを生んだPIDと、待機者の観測回数 |
 | idle_in_transaction | トランザクションを開いたまま待つセッション。最大経過秒 |

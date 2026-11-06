@@ -54,7 +54,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(summary["average_active_sessions"], 4 / 3)
         self.assertEqual(summary["peak_active_sessions"], 2)
         profile = {x["wait"]: x["samples"] for x in summary["wait_profile"]}
-        self.assertEqual(profile, {"CPU (no wait event)": 2, "IO:DataFileRead": 1, "Lock:transactionid": 1})
+        self.assertEqual(profile, {"No reported wait event": 2, "IO:DataFileRead": 1, "Lock:transactionid": 1})
         self.assertEqual(summary["by_query_id"][0]["query_id"], "42")
         self.assertEqual(summary["by_query_id"][0]["samples"], 3)
         self.assertEqual(summary["lock_blockers"], [{"pid": 3, "waiter_samples": 1}])

@@ -105,7 +105,7 @@ def run(args: argparse.Namespace) -> tuple[list, str | None]:
 
 def wait_label(session: dict) -> str:
     if not session.get("wait_event_type"):
-        return "CPU (no wait event)"
+        return "No reported wait event"
     return f"{session.get('wait_event_type')}:{session.get('wait_event')}"
 
 

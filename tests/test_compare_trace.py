@@ -38,7 +38,7 @@ class CompareTests(unittest.TestCase):
                                  report(300, 900, 3000, 990, 10, settings={"work_mem": "65536"}))
         warnings = " ".join(result["statements"][0]["warnings"])
         self.assertIn("load differs", warnings)
-        self.assertIn("cache condition differs", warnings)
+        self.assertIn("cache condition may differ", warnings)
         self.assertIn("verify result correctness", warnings)
         self.assertEqual(result["settings_changed"], {"work_mem": ["4096", "65536"]})
 
@@ -88,6 +88,21 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(orders["bytes_per_request_mean"], 1000)
         self.assertIsNone(next(e for e in result["endpoints"] if e["endpoint"] == "GET /export")["bytes_per_request_mean"])
         self.assertIn("n_plus_one", TRACE.markdown(result))
+
+    def test_pool_wait_share_uses_only_requests_with_pool_measurements(self):
+        records = [
+            {"type": "request", "request_id": "missing", "endpoint": "A", "duration_ms": 100},
+            {"type": "request", "request_id": "unmeasured", "endpoint": "B", "duration_ms": 100},
+            {"type": "request", "request_id": "measured", "endpoint": "B", "duration_ms": 20, "pool_wait_ms": 10},
+            {"type": "request", "request_id": "zero", "endpoint": "C", "duration_ms": 20, "pool_wait_ms": 0},
+        ]
+        absent, partial, measured_zero = TRACE.analyze(lines(records))["endpoints"]
+        self.assertIsNone(absent["pool_wait_share"])
+        self.assertEqual(absent["pool_wait_observed_requests"], 0)
+        self.assertEqual(partial["pool_wait_share"], .5)
+        self.assertEqual(partial["p95_pool_wait_ms"], 10)
+        self.assertEqual(partial["pool_wait_observed_requests"], 1)
+        self.assertEqual(measured_zero["pool_wait_share"], 0)
 
     def test_repetition_without_parent_is_not_called_n_plus_one(self):
         records = [{"type": "db", "request_id": "x", "statement": "poll", "rows": 1, "duration_ms": 1} for _ in range(6)]
