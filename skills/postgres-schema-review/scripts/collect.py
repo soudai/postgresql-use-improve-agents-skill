@@ -34,15 +34,19 @@ def build_query(schemas, limit):
     selected = ",".join(literal(s) for s in schemas)
     queries = {
         "tables": """SELECT t.relation, t.schema, t.relname AS name, t.relkind AS kind,
-          t.relispartition AS partition FROM targets t ORDER BY t.relation""",
+          t.relispartition AS partition,
+          EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid
+                  WHERE i.inhparent=t.oid AND NOT child.relispartition) AS has_inheritance_children
+          FROM targets t ORDER BY t.relation""",
         "columns": """SELECT t.relation, a.attname AS name,
           format_type(a.atttypid,a.atttypmod) AS type,
-          (a.attnotnull OR COALESCE((
+          a.attnotnull AS column_not_null,
+          COALESCE((
             WITH RECURSIVE chain AS (
               SELECT ty.oid,ty.typbasetype,ty.typnotnull FROM pg_type ty WHERE ty.oid=a.atttypid
               UNION ALL SELECT ty.oid,ty.typbasetype,ty.typnotnull
               FROM pg_type ty JOIN chain ch ON ch.typbasetype=ty.oid
-            ) SELECT bool_or(typnotnull) FROM chain),false)) AS not_null,
+            ) SELECT bool_or(typnotnull) FROM chain),false) AS domain_not_null,
           (WITH RECURSIVE chain AS (
             SELECT ty.oid,ty.typbasetype FROM pg_type ty WHERE ty.oid=a.atttypid
             UNION ALL SELECT ty.oid,ty.typbasetype FROM pg_type ty JOIN chain ch ON ch.typbasetype=ty.oid
@@ -59,7 +63,7 @@ def build_query(schemas, limit):
           COALESCE((SELECT jsonb_agg(a.attname ORDER BY k.ord)
             FROM unnest(c.confkey) WITH ORDINALITY k(attnum,ord)
             JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=k.attnum),'[]'::jsonb) AS referenced_columns,
-          c.convalidated AS validated, c.conenforced AS enforced,
+          c.convalidated AS validated, c.conenforced AS enforced, c.connoinherit AS no_inherit,
           CASE WHEN c.contype='f' THEN c.confmatchtype END AS match_type,
           CASE WHEN c.contype='f' THEN c.confupdtype END AS update_action,
           CASE WHEN c.contype='f' THEN c.confdeltype END AS delete_action
@@ -141,7 +145,7 @@ def collect(args):
     major = result["metadata"]["server_version_num"] // 10000
     if major not in (18, 19):
         raise CollectionError("supported_majors_are_18_and_19")
-    document = {"schema_version": 1, "metadata": result["metadata"], "sections": {}}
+    document = {"schema_version": 2, "metadata": result["metadata"], "sections": {}}
     document["metadata"].update(requested_schemas=args.schema, row_limit=args.row_limit)
     for name in SECTIONS:
         rows = result["rows"][name]
@@ -174,7 +178,7 @@ def main(argv=None):
         document = collect(args)
     except CollectionError as exc:
         # Keep errors useful without returning raw server text or connection secrets.
-        document = {"schema_version": 1,
+        document = {"schema_version": 2,
                     "metadata": {"collected_at": datetime.now(timezone.utc).isoformat(),
                                  "requested_schemas": args.schema},
                     "sections": {name: {"status": "error", "reason": str(exc),

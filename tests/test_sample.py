@@ -27,13 +27,13 @@ def session(pid, state="active", wait_type=None, wait=None, query_id="42", **ext
 
 
 SAMPLES = [
-    {"at": "t1", "sessions": [session(1), session(2, wait_type="IO", wait="DataFileRead"),
+    {"at": "t1", "track_activities": "on", "sessions": [session(1), session(2, wait_type="IO", wait="DataFileRead"),
                               session(3, "idle in transaction", "Client", "ClientRead", xact_age_s=30.5)]},
-    {"at": "t2", "sessions": [session(1), session(4, wait_type="Lock", wait="transactionid", query_id="7",
+    {"at": "t2", "track_activities": "on", "sessions": [session(1), session(4, wait_type="Lock", wait="transactionid", query_id="7",
                                                    blocking_pids=[3]),
                               {"pid": 9, "backend_type": "autovacuum worker", "state": "active",
                                "wait_event_type": "Timeout", "wait_event": "VacuumDelay"}]},
-    {"at": "t3", "sessions": []},
+    {"at": "t3", "track_activities": "on", "sessions": []},
 ]
 
 

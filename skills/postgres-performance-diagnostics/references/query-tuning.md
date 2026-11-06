@@ -43,7 +43,17 @@ PostgreSQL 18以降は`ANALYZE`指定時に`BUFFERS`が既定で有効。`SELECT
 
 `analyze_plan.py`の`hotspots`は、各ノードの`Actual Total Time × loops`から子ノード分を引いた自己時間の上位。手順2の出発点に使う。parallel workerのノードは各プロセスの合計になり実時間を超え得る。CTE・SubPlanの再利用でも近似になる。
 
-自動候補のうち、`repeated_seq_scan`はNested Loopの内側で繰り返すSeq Scan、`lossy_bitmap`は`work_mem`を超えてページ単位の再検査になったBitmap Heap Scan、`index_only_heap_fetches`はvisibility mapが古くheapを読んだIndex Only Scan、`planning_dominates`・`jit_overhead`は計画・JITの時間が実行に比べて大きい計画を示す。`join_discards_scanned_rows`は10万行以上を走査した入力のうち1%以下しか結合結果に残らないJOINで、その側の結合キーの索引を検討する。`uses_parameter_placeholders`は条件に`$1`等が残るgeneric planであることを示し、推定誤差と重なると`generic_plan_misestimate`になる。
+自動候補のうち、`repeated_seq_scan`は繰り返すSeq Scan、`index_only_heap_fetches`はall-visibleでないページのheapを読んだIndex Only Scan、`planning_dominates`・`jit_overhead`は計画・JITの時間が実行に比べて大きい計画を示す。`join_discards_scanned_rows`は10万行以上を走査した入力のうち1%以下しか結合結果に残らないJOINで、結合キーの索引を調べる候補になる。
+
+`lossy_bitmap`はページ単位の再検査を観測したもの。`work_mem`不足は原因の候補だが、[BRINは設計上lossyな索引](https://www.postgresql.org/docs/18/brin.html)なので、lossy blocksだけでメモリ不足と断定しない。索引のaccess method、選択性、recheckで除いた行数、BRINの`pages_per_range`と物理配置との相関を確認する。対象テーブルの`sql/inspect_relation.sql`の出力を`--relation-evidence relation.json`で渡せる。`VERBOSE`付きの計画からschema・table・index名が一致した場合だけaccess methodを付記する。同じDB・DDL状態の証拠を使い、schema不明や不一致は未確認のまま扱う。
+
+`uses_parameter_placeholders`は引用符の外のパラメータ候補が残る観測で、generic planの確定ではない。文字列・引用識別子中の`$1`や、名前が明示されたInitPlanの出力パラメータは除外する。`generic_plan_misestimate`は採取元でgenericだと確認でき、行数推定にも誤差があった場合だけ出す。genericであることが誤差の原因だとまでは証明しない。
+
+```text
+python scripts/analyze_plan.py plan.json --plan-mode generic --plan-source experiment-42-forced-generic
+```
+
+`--plan-mode generic|custom`には、秘密情報を含まない採取記録の参照先`--plan-source`が必要。同じセッションで`plan_cache_mode=force_generic_plan`／`force_custom_plan`を設定した`EXPLAIN EXECUTE`や、実行前後の`pg_prepared_statements.generic_plans/custom_plans`の差分を根拠にする。`auto`設定だけでは実際のモードを決めない。[PREPAREの計画選択](https://www.postgresql.org/docs/18/sql-prepare.html)を参照する。入力を`{"plan": [...], "capture": {"plan_mode": "generic", "source": "experiment-42"}}`で包む方法もある。出所が不明ならmodeは`unknown`で、通常の`cardinality_mismatch`は残る。
 
 LIMITによって上位ノードが途中で処理を止めた場合や、実行されなかった枝では、通常の全件実行と同じ条件で行数を比較できない。実測がない計画は、実行時間・spill・実際の読み取り量を証明しない。
 

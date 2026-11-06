@@ -1,6 +1,6 @@
 # パラメータ別の考え方
 
-値は出発点。環境とワークロードで検証して決める。「反映」は`pg_settings.context`による（postmaster=再起動、sighup=reload、user=reload／ロール／セッション）。実サーバの`pg_settings`で単位・既定値・有効な値を確認する。
+「既定」は対象版の仕様、「出発点」は本skillの条件付きヒューリスティック。数値だけで誤設定や変更の必要性を確定せず、負荷・資源の前提、測定窓、採用・棄却する検証条件を添える。環境とワークロードで検証して決める。「反映」は`pg_settings.context`による（postmaster=再起動、sighup=reload、user=reload／ロール／セッション）。実サーバの`pg_settings`で単位・既定値・有効な値を確認する。
 
 ## メモリ
 
@@ -15,24 +15,27 @@
 | autovacuum_work_mem | 既定-1（maintenance_work_memを使用） | autovacuum workerごとに使う。worker数との積で予算を確認する |
 | temp_file_limit | 既定-1（無制限） | 暴走クエリのtempでディスクが埋まるのを防ぐ。正当な大規模処理の上限も考慮する |
 
-work_memの上限の目安:
+work_memの総予算を考える粗い試算（安全な上限の保証ではない）:
 
 ```text
-(PostgreSQLに使えるメモリ × 0.8 − shared_buffers)
-  ÷ (同時にactiveなセッション数 × 2ノード × hash_mem_multiplier)
+(PostgreSQLに使えるメモリ × 0.8 − shared_buffers
+ − 同時保守コマンド数 × maintenance_work_mem
+ − autovacuum worker予算数 × autovacuum_work_mem)
+ ÷ ((active query数 + 並列worker予算数)
+    × (同時sortノード数 + 同時hashノード数 × hash_mem_multiplier))
 ```
 
-同時activeセッション数は、poolのサイズや観測した平均・ピークのアクティブセッション数から決める。`max_connections`で割ると過小評価になりやすい。OOM killerが動く環境では余裕を残す。
+20%の余力やノード数は仮定であり、共有ハッシュ等の実装差とピークRSSを実測して補う。autovacuum_work_mem=-1はmaintenance_work_memで計算する。同時activeセッション数は、poolのサイズや観測した平均・ピークのアクティブセッション数から決める。`max_connections`で割ると過小評価になりやすい。OOM killerが動く環境では余裕を残す。
 
 ## 接続
 
-`max_connections`はメモリ（接続ごとの固定領域とlock table）と、snapshot取得のコストに関わる。同時にactiveなセッションをCPUコア数の数倍程度に抑えると、throughputが安定しやすい。接続数が多い場合は、設定値を上げる前にPgBouncer等のconnection poolerを検討する。`max_connections`の変更は再起動が必要で、standbyではprimary以上の値が必要。
+`max_connections`はメモリ（接続ごとの固定領域とlock table）と、snapshot取得のコストに関わる。同時active数をCPUコア数と比べることは試験条件を作る手掛かりになるが、I/O待ちと処理構成によって適正値は変わる。throughputと待ち時間を測って決める。接続数が多い場合は、設定値を上げる前にPgBouncer等のconnection poolerを検討する。`max_connections`の変更は再起動が必要で、standbyではprimary以上の値が必要。
 
 ## WALとチェックポイント
 
 | パラメータ | 出発点 | 考え方・注意 |
 | --- | --- | --- |
-| max_wal_size | 既定1GB。WAL量に合わせる | checkpointの多くが`num_requested`（WAL量による）なら小さすぎる。目安は`WAL生成速度 × checkpoint_timeout × 2`。pg_walの容量と、クラッシュ復旧時間が増える |
+| max_wal_size | 既定1GB。原因を確認後にWAL量から試算 | num_requestedだけではWAL量による要求か分からない。checkpoint原因ログと同じ窓のWAL量・保持量・空き容量を確認する。ソフト上限であり、pg_wal使用量の上限ではない |
 | min_wal_size | 既定80MB | WALファイルの再利用量。WAL量が周期的に急増する環境で上げる |
 | checkpoint_timeout | 既定5min。書き込みの多い環境では15min程度 | checkpoint後の最初の更新でfull-page imageが書かれる。間隔を延ばすとFPIとI/Oが減り、復旧時間が延びる |
 | checkpoint_completion_target | 0.9（14以降の既定） | 書き込みをcheckpoint間隔に分散する |
@@ -40,6 +43,10 @@ work_memの上限の目安:
 | wal_buffers | 既定-1（shared_buffersの1/32、最大16MB） | `pg_stat_wal.wal_buffers_full`が増え続ける場合に64MB程度へ。再起動が必要 |
 | synchronous_commit | `on` | `off`は直近のcommitを失い得る（破損はしない）。許容できる処理だけトランザクション・ロール単位で使う |
 | fsync, full_page_writes | `on` | 性能目的で`off`にしない。データ破損の危険がある |
+
+num_requestedには手動CHECKPOINTなども含まれる。要求数の増加は調査の入口とし、同じ区間のlog_checkpointsと運用履歴で原因を確認する。[checkpointer統計](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-CHECKPOINTER-VIEW)、[CHECKPOINT](https://www.postgresql.org/docs/18/sql-checkpoint.html)
+
+max_wal_sizeは自動checkpointに関するソフト上限。高負荷、archive失敗、WAL保持設定などで超え得るため、設定値からディスク使用量の保証を導かない。増加案は復旧時間と保持要因も含めて検証する。[max_wal_size](https://www.postgresql.org/docs/18/runtime-config-wal.html#GUC-MAX-WAL-SIZE)
 
 ## プランナとI/O
 
@@ -51,24 +58,30 @@ work_memの上限の目安:
 | io_method | PostgreSQL 18の既定`worker` | `io_uring`はLinuxの対応ビルドで利用可能。`sync`は従来の同期I/O。再起動が必要。変更は前後測定する |
 | io_workers | 既定3 | `io_method=worker`のworker数。I/Oの多い環境とCPUに応じて調整する |
 | default_statistics_target | 既定100 | 全体を上げると統計の取得・計画が重くなる。推定誤差のある列だけ`ALTER TABLE ... ALTER COLUMN ... SET STATISTICS`で上げる |
-| jit | OLTPでは`off`または`jit_above_cost`を上げる | 短いクエリでコンパイル時間が実行時間を上回ることがある。`pg_stat_statements`のjit時間で判断する |
+| jit | 代表処理でON/OFFやjit_above_costを比較 | 短い処理ではコンパイル負担が大きくなり得るが、比率だけで無効化しない。コンパイルを含む総実行時間を同条件で比較する |
 | plan_cache_mode | 既定`auto` | 全体変更ではなく、問題のあるprepared statementの利用箇所で対処する |
+
+jit_deform_timeはjit_generation_timeの内訳なので、JIT合計に再加算しない。必要な区間カウンタが欠ける場合は0で補わず比率を未評価にする。合計はgeneration + inlining + optimization + emissionとし、同じtop-level SQLの区間総実行時間と比べる。[計測列](https://www.postgresql.org/docs/18/pgstatstatements.html)、[PostgreSQL 18の計測構造](https://raw.githubusercontent.com/postgres/postgres/REL_18_STABLE/src/include/jit/jit.h)
+
+レビューの5%は比較試験を始める目安。コンパイル後の高速化を相殺した純損失は示さない。データ、パラメータ、計画・prepared statement、cache、同時負荷を揃え、ON/OFFの総時間とばらつきを比較する。長い分析処理での退行も確認する。[JITを使う条件](https://www.postgresql.org/docs/18/jit-decision.html)
 
 ## 並列実行
 
-`max_worker_processes`は並列クエリ、論理レプリケーション、拡張のbackground workerで共有する上限（再起動が必要）。`max_parallel_workers`はその中の並列クエリの上限で、CPU数を超えない。`max_parallel_workers_per_gather`はOLTPでは既定2のまま、同時実行の少ない分析処理で増やす。workerはそれぞれwork_memを使う。`max_parallel_maintenance_workers`はCREATE INDEX等で使う。
+`max_worker_processes`は並列クエリ、論理レプリケーション、拡張のbackground workerで共有する上限（再起動が必要）。`max_parallel_workers`はその中の並列処理の上限であり、設定値は実際の同時稼働数を表さない。CPU数との比較だけで下げず、起動されたworker数、CPU/I/O待ち、同時負荷を測る。`max_parallel_workers_per_gather`はOLTPでは既定2のまま、同時実行の少ない分析処理で増やす。workerの演算にもwork_mem予算が必要。`max_parallel_maintenance_workers`はCREATE INDEX等で使う。要求したworkerがすべて起動する保証はない。[workerの上限と実行時の制約](https://www.postgresql.org/docs/18/runtime-config-resource.html#RUNTIME-CONFIG-RESOURCE-WORKER-PROCESSES)
 
 ## autovacuum
 
 | パラメータ | 出発点 | 考え方・注意 |
 | --- | --- | --- |
-| autovacuum | `on` | 無効化しない。特定テーブルだけ止める場合もwraparound対策は動く |
+| autovacuum | `on` | offは通常の保守を止めるが、必要なwraparound防止のautovacuumは起動し得る。無効化してもworkerのメモリ予算をゼロにしない |
 | autovacuum_max_workers | 既定3。大規模・多テーブルで5〜6 | PostgreSQL 18は`autovacuum_worker_slots`（再起動）までreloadで変更できる |
 | autovacuum_vacuum_cost_limit | 既定-1（vacuum_cost_limit=200を使用）。SSDで1000〜2000 | 全workerで共有する予算。workerを増やすだけでは1つあたりが遅くなる |
 | autovacuum_vacuum_cost_delay | 2ms（12以降の既定） | 20ms等の古い値は処理を大きく抑制する |
 | autovacuum_naptime | 既定1min | 多数のDBがある場合、各DBの巡回間隔に影響する |
 | autovacuum_vacuum_scale_factor等 | 全体は既定、巨大・高更新テーブルはテーブル単位で下げる | `ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = ...)`。PostgreSQL 18は`autovacuum_vacuum_max_threshold`（既定1億行）で巨大テーブルの閾値に上限がある |
 | track_cost_delay_timing | PostgreSQL 18 | cost delayで待った時間を進捗ビュー・ログで確認できる。計測負荷を`pg_test_timing`で確認 |
+
+autovacuum=offでもwraparound防止処理は必要時に起動する。通常保守の停止リスクと、緊急保守の資源消費を別に確認する。[autovacuumの仕様](https://www.postgresql.org/docs/18/runtime-config-vacuum.html#GUC-AUTOVACUUM)
 
 autovacuumが追い付かない原因が、古いsnapshot・replication slot・prepared transactionによる回収不能なら、設定変更では解決しない。
 
@@ -107,4 +120,4 @@ Amazon RDS／Aurora、Cloud SQL、Azure Database for PostgreSQL等は、パラ�
 
 ## 総メモリの見積もり
 
-ホストの`--ram-gb`とcgroup／サービスの`--memory-limit-gb`の小さい方を使う。`--max-active-connections`、`--sort-nodes`、`--hash-nodes`、`--parallel-workers-per-query`、`--maintenance-jobs`に同時に重なる量を入力する。leaderとworkerに演算の予算を配り、保守メモリは同時コマンドとautovacuum workerごとに確保する。並列保守コマンドのmaintenance_work_memはコマンド全体の予算とする。20%の余力と共有領域を確保した残額から概算する。共有ハッシュ領域、バックエンドの固定費、OSキャッシュ等は実測で確認する。計画やピーク負荷の入力がない場合は、レポートの仮定と不足情報を確認する。
+ホストの`--ram-gb`とcgroup／サービスの`--memory-limit-gb`の小さい方を使う。`--max-active-connections`、`--sort-nodes`、`--hash-nodes`、`--parallel-workers-per-query`、`--maintenance-jobs`に同時に重なる量を入力する。leaderとworkerに演算の予算を配り、保守メモリは同時コマンドとautovacuum workerごとに確保する。並列保守コマンドのmaintenance_work_memはコマンド全体の予算とする。20%の余力と共有領域を確保した残額から概算する。共有ハッシュ領域、バックエンドの固定費、OSキャッシュ等は実測で確認する。worker予算は観測した実稼働数と区別する。計画やピーク負荷の入力がない場合は、レポートの仮定と不足情報を確認する。

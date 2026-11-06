@@ -15,21 +15,27 @@ def section(rows):
 
 
 def fixture():
-    snapshot = {"schema_version": 1, "metadata": {"collected_at": "2026-11-06T01:00:00Z"},
+    snapshot = {"schema_version": 2, "metadata": {"collected_at": "2026-11-06T01:00:00Z"},
                 "sections": {
         "tables": section([
-            {"relation": "public.orders", "schema": "public", "name": "orders", "kind": "r"},
-            {"relation": "public.users", "schema": "public", "name": "users", "kind": "r"}]),
+            {"relation": "public.orders", "schema": "public", "name": "orders", "kind": "r", "has_inheritance_children": False},
+            {"relation": "public.users", "schema": "public", "name": "users", "kind": "r", "has_inheritance_children": False}]),
         "columns": section([]),
         "constraints": section([]), "indexes": section([]), "statistics": section([])}}
     # Keep the column fixture explicit; no application row values are required.
     snapshot["sections"]["columns"]["rows"] = [
-        {"relation": "public.orders", "name": "tenant_id", "type": "integer", "not_null": True},
-        {"relation": "public.orders", "name": "user_id", "type": "integer", "not_null": True},
-        {"relation": "public.orders", "name": "paid_at", "type": "timestamp", "not_null": False},
-        {"relation": "public.orders", "name": "is_paid", "type": "boolean", "not_null": True},
-        {"relation": "public.users", "name": "tenant_id", "type": "integer", "not_null": True},
-        {"relation": "public.users", "name": "id", "type": "integer", "not_null": True}]
+        {"relation": "public.orders", "name": "tenant_id", "type": "integer", "column_not_null": True},
+        {"relation": "public.orders", "name": "user_id", "type": "integer", "column_not_null": True},
+        {"relation": "public.orders", "name": "paid_at", "type": "timestamp", "column_not_null": False},
+        {"relation": "public.orders", "name": "is_paid", "type": "boolean", "column_not_null": True},
+        {"relation": "public.users", "name": "tenant_id", "type": "integer", "column_not_null": True},
+        {"relation": "public.users", "name": "id", "type": "integer", "column_not_null": True}]
+    for column in snapshot["sections"]["columns"]["rows"]:
+        column["domain_not_null"] = False
+        if column["column_not_null"]:
+            snapshot["sections"]["constraints"]["rows"].append({
+                "relation": column["relation"], "name": column["name"] + "_nn", "type": "n",
+                "columns": [column["name"]], "validated": True, "enforced": True})
     contract = {"schema_version": 1, "tables": [{
         "relation": "public.orders", "source": "design/orders.md:12",
         "relationships": [{
@@ -67,11 +73,20 @@ class StructureTest(unittest.TestCase):
         return [f for f in result if rule is None or f["rule"] == "schema." + rule]
 
     def add_fk(self, **changes):
-        self.snapshot["sections"]["constraints"]["rows"].append(foreign_key(**changes))
+        self.snapshot["sections"]["constraints"]["rows"].insert(0, foreign_key(**changes))
 
     def col(self, name):
         return next(r for r in self.snapshot["sections"]["columns"]["rows"]
                     if r["relation"] == "public.orders" and r["name"] == name)
+
+    def set_nullability(self, name, required):
+        self.col(name)["column_not_null"] = required
+        constraints = self.snapshot["sections"]["constraints"]["rows"]
+        constraints[:] = [c for c in constraints if not (
+            c["relation"] == "public.orders" and c["type"] == "n" and c["columns"] == [name])]
+        if required:
+            constraints.append({"relation": "public.orders", "name": name + "_nn", "type": "n",
+                                "columns": [name], "validated": True, "enforced": True})
 
     def test_missing_expected_fk_is_confirmed(self):
         findings = self.review("fk")
@@ -137,13 +152,13 @@ class StructureTest(unittest.TestCase):
 
     def test_nullable_fk_is_legitimate_when_declared(self):
         self.expected["allow_null"] = True
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.add_fk()
         self.assertEqual(self.review(), [])
 
     def test_all_nullable_match_full_does_not_guarantee_required_reference(self):
-        self.col("tenant_id")["not_null"] = False
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("tenant_id", False)
+        self.set_nullability("user_id", False)
         self.add_fk(match_type="f")
         result = self.review("fk")
         self.assertEqual(len(result), 2)
@@ -151,42 +166,42 @@ class StructureTest(unittest.TestCase):
         self.assertIn("MATCH FULL", " ".join(result[0]["verification"]))
 
     def test_match_full_with_one_not_null_guarantees_all_members_required(self):
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.table["required_columns"] = ["user_id"]
         self.add_fk(match_type="f")
         self.assertEqual(self.review("fk"), [])
         self.assertEqual(self.review("null"), [])
 
     def test_all_nullable_match_full_does_not_suppress_required_columns(self):
-        self.col("tenant_id")["not_null"] = False
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("tenant_id", False)
+        self.set_nullability("user_id", False)
         self.table["required_columns"] = ["user_id"]
         self.add_fk(match_type="f")
         self.assertEqual(self.review("null")[0]["status"], "confirmed")
 
     def test_unvalidated_match_full_cannot_prove_existing_rows_nonnull(self):
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.table["required_columns"] = ["user_id"]
         self.add_fk(match_type="f", validated=False)
         self.assertTrue(any("NULL" in f["summary"] for f in self.review("fk")))
         self.assertEqual(self.review("null")[0]["status"], "confirmed")
 
     def test_unenforced_match_full_does_not_suppress_null_finding(self):
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.table["required_columns"] = ["user_id"]
         self.add_fk(match_type="f", enforced=False)
         self.assertTrue(any("NULL" in f["summary"] for f in self.review("fk")))
         self.assertEqual(self.review("null")[0]["status"], "confirmed")
 
     def test_unknown_match_full_validation_does_not_suppress_null_finding(self):
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.table["required_columns"] = ["user_id"]
         self.add_fk(match_type="f")
         self.snapshot["sections"]["constraints"]["rows"][0].pop("validated")
         self.assertEqual(self.review("null")[0]["status"], "confirmed")
 
     def test_null_profile_conflicting_with_match_full_requires_reconciliation(self):
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.add_fk(match_type="f")
         self.evidence["profiles"] = [profile(columns=["user_id"])]
         result = self.review("null")
@@ -195,7 +210,7 @@ class StructureTest(unittest.TestCase):
         self.assertIn("時点", " ".join(result[0]["missing"]))
 
     def test_equivalent_check_protection_requires_review(self):
-        self.col("user_id")["not_null"] = False
+        self.set_nullability("user_id", False)
         self.add_fk()
         self.snapshot["sections"]["constraints"]["rows"].append({
             "relation": "public.orders", "name": "required_user", "type": "c",
@@ -248,7 +263,8 @@ class StructureTest(unittest.TestCase):
         self.assertTrue(result["missing"])
 
     def test_domain_check_requires_equivalent_protection_review_for_required_fk(self):
-        self.col("user_id").update(not_null=False, domain_has_check=True)
+        self.set_nullability("user_id", False)
+        self.col("user_id")["domain_has_check"] = True
         self.add_fk()
         result = self.review("fk")[0]
         self.assertEqual(result["status"], "candidate")
@@ -286,7 +302,7 @@ class StructureTest(unittest.TestCase):
 
     def test_profile_conflicting_with_current_not_null_needs_reconciliation(self):
         self.table["required_columns"] = ["paid_at"]
-        self.col("paid_at")["not_null"] = True
+        self.set_nullability("paid_at", True)
         self.evidence["profiles"] = [profile()]
         result = self.review("null")[0]
         self.assertEqual(result["status"], "needs_evidence")

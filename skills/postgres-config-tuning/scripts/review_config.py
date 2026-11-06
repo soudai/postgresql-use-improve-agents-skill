@@ -124,7 +124,8 @@ class Review:
                      "A crash can lose recently acknowledged commits (no corruption).", scope="role/transaction")
         for name in ("autovacuum", "track_counts"):
             if raw(self.s, name) == "off":
-                self.add(name, "critical", "on", "Without it dead rows accumulate and XID wraparound protection depends on manual VACUUM.")
+                self.add(name, "critical", "on", "Routine cleanup or its statistics are disabled. Dead tuples and stale statistics need attention; "
+                         "anti-wraparound autovacuum can still run even when autovacuum is off.")
 
     # --- memory ------------------------------------------------------------------------------
     def memory(self):
@@ -248,13 +249,14 @@ class Review:
         elif (self.ev.get("interval_seconds") or 0) < 3 * timeout:
             self.skip("max_wal_size", "interval shorter than 3 x checkpoint_timeout")
         elif requested + timed > 0 and requested / (requested + timed) > 0.1:
-            current = number(self.s, "max_wal_size") or GB
             rate = self.ev.get("wal_bytes_per_s")
-            target = max(current * 2, math.ceil(rate * timeout * 2 / GB) * GB if rate else 0)
-            self.add("max_wal_size", "high", size(target),
-                     "Checkpoints are triggered by WAL volume rather than checkpoint_timeout, multiplying full-page writes and I/O bursts.",
-                     caveat="pg_wal can grow to about this size; check disk space and accept longer crash recovery.",
-                     evidence={"requested": requested, "timed": timed, "wal_bytes_per_s": rate})
+            self.add("max_wal_size", "medium", None,
+                     "Requested checkpoints were observed; the counters do not identify their cause.",
+                     caveat="Correlate checkpoint log reasons with this interval before sizing max_wal_size. "
+                            "Manual/forced checkpoints also increment num_requested. max_wal_size is a soft "
+                            "checkpoint target, not a disk-usage bound; archiving and retained WAL can exceed it.",
+                     evidence={"requested": requested, "timed": timed, "wal_bytes_per_s": rate,
+                               "cause": "unknown"})
         fpi = self.ev.get("fpi_share")
         if raw(self.s, "wal_compression") == "off" and (fpi is None or fpi > 0.2):
             self.add("wal_compression", "low", "lz4 (or zstd)",
@@ -294,12 +296,17 @@ class Review:
         share = self.ev.get("jit_share")
         if raw(self.s, "jit") != "on":
             return
+        if self.ev.get("jit_missing_fields"):
+            self.skip("jit evidence", "Missing interval counters: " + ", ".join(self.ev["jit_missing_fields"]))
         if share is not None and share > 0.05:
-            self.add("jit", "high", "off (or raise jit_above_cost)",
-                     f"JIT compilation is {share:.0%} of top-level execution time in the interval.", evidence={"jit_share": share})
+            self.add("jit", "medium", None,
+                     f"JIT compilation is {share:.0%} of top-level execution time in the interval.",
+                     caveat="Compilation cost alone does not establish net harm. Compare the same representative "
+                            "queries with JIT on/off, including total execution time and other workloads.",
+                     evidence={"jit_share": share}, scope="role/session")
         elif self.args.workload == "oltp":
-            self.add("jit", "low", "off for OLTP roles, or raise jit_above_cost",
-                     "Short OLTP queries rarely benefit; mis-estimated costs can trigger expensive compilation.",
+            self.add("jit", "low", None,
+                     "OLTP workload declared; identify representative short queries for a scoped JIT on/off trial.",
                      scope="global or role")
 
     def parallel(self):
@@ -312,7 +319,8 @@ class Review:
             self.skip("parallel", "--cpus not given")
             return
         if mpw is not None and mpw > self.args.cpus:
-            self.add("max_parallel_workers", "low", str(self.args.cpus), "More parallel workers than CPUs only adds contention.")
+            self.add("max_parallel_workers", "low", str(self.args.cpus), "The configured parallel-worker ceiling exceeds CPU count; check actual concurrent workers and CPU/I/O waits.",
+                     caveat="A ceiling is not observed usage. Test the workload before reducing it.")
         if per_gather is not None:
             if self.args.workload == "olap" and per_gather <= 2 and self.args.cpus >= 8:
                 self.add("max_parallel_workers_per_gather", "low", str(min(self.args.cpus // 2, 8)),
@@ -417,11 +425,18 @@ def evidence_from_report(report: dict | None) -> dict:
         result["temp_bytes_per_s"] = database["per_second"].get("temp_bytes")
         result["average_active_sessions"] = database.get("average_active_sessions")
     sql = [x for x in deltas.get("pgss") or [] if x.get("toplevel") is not False]
-    total = sum(x["delta"].get("total_exec_time", 0) for x in sql)
-    jit = sum(x["delta"].get(k, 0) for x in sql for k in
-              ("jit_generation_time", "jit_inlining_time", "jit_optimization_time", "jit_emission_time", "jit_deform_time"))
-    if sql and total > 0:
-        result["jit_share"] = jit / total
+    # PostgreSQL includes deform_counter in generation_counter; never add it twice.
+    jit_fields = ("jit_generation_time", "jit_inlining_time", "jit_optimization_time", "jit_emission_time")
+    required = ("total_exec_time", *jit_fields)
+    missing = sorted({key for row in sql for key in required
+                      if type(row["delta"].get(key)) not in (int, float)
+                      or not math.isfinite(row["delta"][key]) or row["delta"][key] < 0})
+    if missing:
+        result["jit_missing_fields"] = missing
+    elif sql:
+        total = sum(row["delta"]["total_exec_time"] for row in sql)
+        if total > 0:
+            result["jit_share"] = sum(row["delta"][key] for row in sql for key in jit_fields) / total
     return result
 
 

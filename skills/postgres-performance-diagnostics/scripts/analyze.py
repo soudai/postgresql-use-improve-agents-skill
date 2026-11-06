@@ -369,11 +369,12 @@ def redundant_indexes(indexes):
     return sorted(found, key=lambda x: x["index_bytes"] if numeric(x["index_bytes"]) else 0, reverse=True)
 
 
-def autovacuum_backlog(tables, values):
-    """Tables already past their autovacuum/autoanalyze trigger, using table reloptions over globals."""
+def autovacuum_backlog(tables, values, *, include_unknown=False):
+    """Past triggers; optionally include unassessed tables instead of treating missing inputs as zero."""
     def setting(options, name):
         try:
-            return float(options[name] if name in options else values[name])
+            value = float(options[name] if name in options else values[name])
+            return value if numeric(value) else None
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -393,36 +394,66 @@ def autovacuum_backlog(tables, values):
             continue
         if row.get("relkind") not in ("r", "m"):
             continue
-        reltuples = max(row["reltuples"], 0) if numeric(row.get("reltuples")) else 0
-        enabled = (values.get("autovacuum") == "on"
-                   and options.get("autovacuum_enabled", "on").lower() not in ("off", "false", "no", "0"))
+        # A real catalog -1 means never vacuumed and is treated as zero by PostgreSQL;
+        # an absent field in an older/partial snapshot is not the same evidence.
+        reltuples = max(row["reltuples"], 0) if numeric(row.get("reltuples")) else None
+        table_enabled = options.get("autovacuum_enabled", "on").lower() not in ("off", "false", "no", "0")
+        enabled = (False if not table_enabled or values.get("autovacuum") == "off" or values.get("track_counts") == "off"
+                   else True if values.get("autovacuum") == "on" and values.get("track_counts") == "on" else None)
         entry = {"schemaname": row.get("schemaname"), "relname": row.get("relname"), "autovacuum_enabled": enabled,
-                 "last_autovacuum": row.get("last_autovacuum"), "last_autoanalyze": row.get("last_autoanalyze")}
-        base, scale = setting(options, "autovacuum_vacuum_threshold"), setting(options, "autovacuum_vacuum_scale_factor")
-        if base is not None and scale is not None and numeric(row.get("n_dead_tup")):
-            threshold = base + scale * reltuples
-            cap = setting(options, "autovacuum_vacuum_max_threshold")
-            if cap is not None and cap >= 0:
+                 "last_autovacuum": row.get("last_autovacuum"), "last_autoanalyze": row.get("last_autoanalyze"),
+                 "unknown_triggers": [], "exceeded_triggers": [], "missing_evidence": {}}
+
+        def assess(kind, counter, base_name, scale_name, *, insert=False, capped=False):
+            base, scale = setting(options, base_name), setting(options, scale_name)
+            if insert and base == -1:
+                return  # Explicitly disabled, not unknown.
+            missing = []
+            for name, value in ((base_name, base), (scale_name, scale),
+                                ("reltuples", reltuples), (counter, row.get(counter))):
+                if not numeric(value):
+                    missing.append(name)
+            if values.get("track_counts") != "on":
+                missing.append("track_counts=on")
+            cap = setting(options, "autovacuum_vacuum_max_threshold") if capped else None
+            if capped and cap is None:
+                missing.append("autovacuum_vacuum_max_threshold")
+            fraction = 1.0
+            if insert:
+                pages, frozen = row.get("relpages"), row.get("relallfrozen")
+                for name, value in (("relpages", pages), ("relallfrozen", frozen)):
+                    if not numeric(value) or value < 0:
+                        missing.append(name)
+                if not missing and pages > 0 and frozen > 0:
+                    # PostgreSQL 18+ relation_needs_vacanalyze: clamp manually changed catalog estimates.
+                    fraction = 1 - min(frozen, pages) / pages
+            if missing:
+                entry["unknown_triggers"].append(kind)
+                entry["missing_evidence"][kind] = missing
+                return
+            threshold = base + scale * reltuples * fraction
+            if capped and cap >= 0:
                 threshold = min(threshold, cap)
-            entry.update(n_dead_tup=row["n_dead_tup"], dead_threshold=threshold,
-                         dead_ratio=ratio(row["n_dead_tup"], threshold))
-        base = setting(options, "autovacuum_vacuum_insert_threshold")
-        scale = setting(options, "autovacuum_vacuum_insert_scale_factor")
-        if base is not None and base >= 0 and scale is not None and numeric(row.get("n_ins_since_vacuum")):
-            # Approximate: PostgreSQL 18+ scales this term by the unfrozen fraction of the table.
-            threshold = base + scale * reltuples
-            entry.update(n_ins_since_vacuum=row["n_ins_since_vacuum"], insert_threshold=threshold,
-                         insert_ratio=ratio(row["n_ins_since_vacuum"], threshold))
-        base, scale = setting(options, "autovacuum_analyze_threshold"), setting(options, "autovacuum_analyze_scale_factor")
-        if base is not None and scale is not None and numeric(row.get("n_mod_since_analyze")):
-            threshold = base + scale * reltuples
-            entry.update(n_mod_since_analyze=row["n_mod_since_analyze"], analyze_threshold=threshold,
-                         analyze_ratio=ratio(row["n_mod_since_analyze"], threshold))
+            entry.update({counter: row[counter], kind + "_threshold": threshold,
+                          kind + "_ratio": ratio(row[counter], threshold)})
+            if insert:
+                entry["unfrozen_fraction"] = fraction
+            # Compare directly: a zero threshold has no finite ratio but can still be exceeded.
+            if row[counter] > threshold:
+                entry["exceeded_triggers"].append(kind)
+
+        assess("dead", "n_dead_tup", "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor", capped=True)
+        assess("insert", "n_ins_since_vacuum", "autovacuum_vacuum_insert_threshold",
+               "autovacuum_vacuum_insert_scale_factor", insert=True)
+        assess("analyze", "n_mod_since_analyze", "autovacuum_analyze_threshold", "autovacuum_analyze_scale_factor")
         ratios = [entry.get(k) for k in ("dead_ratio", "insert_ratio", "analyze_ratio") if numeric(entry.get(k))]
-        if ratios and max(ratios) > 1:
-            entry.update(reason="past_trigger_threshold", ratio=max(ratios))
+        if entry["exceeded_triggers"]:
+            entry.update(reason="past_trigger_threshold", ratio=max(ratios) if ratios else None)
             found.append(entry)
-    return sorted(found, key=lambda x: (x["ratio"] is not None, x["ratio"] or 0), reverse=True)
+        elif include_unknown and entry["unknown_triggers"]:
+            entry.update(reason="insufficient_trigger_evidence", ratio=None)
+            found.append(entry)
+    return sorted(found, key=lambda x: (x["reason"] == "past_trigger_threshold", x["ratio"] or 0), reverse=True)
 
 
 def analyze(before, after, top=10):
@@ -504,7 +535,11 @@ def analyze(before, after, top=10):
     current["lock_chains"] = lock_chains(after)[:top]
     current["xmin_horizon_holders"] = xmin_horizon_holders(after)[:top]
     current["redundant_indexes"] = redundant_indexes(rows(after, "indexes"))[:top]
-    current["autovacuum_backlog"] = autovacuum_backlog(rows(after, "tables"), settings(after))[:top]
+    maintenance = autovacuum_backlog(rows(after, "tables"), settings(after), include_unknown=True)
+    current["autovacuum_backlog"] = [x for x in maintenance if x["reason"] != "insufficient_trigger_evidence"][:top]
+    current["autovacuum_unassessed"] = [x for x in maintenance if x.get("unknown_triggers")][:top]
+    if current["autovacuum_unassessed"]:
+        warnings.append("autovacuum: some trigger inputs are missing; see current.autovacuum_unassessed")
     metadata = {key: after["metadata"].get(key) for key in
                 ("database", "database_oid", "server_version_num", "postmaster_start", "in_recovery",
                  "session_role", "effective_role", "extensions")}

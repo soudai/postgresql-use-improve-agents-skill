@@ -7,6 +7,7 @@ SELECT s.*,
        c.relfilenode,
        c.reloptions,
        c.relpages,
+       c.relallfrozen,
        c.reltuples,
        c.reltoastrelid,
        CASE WHEN c.relkind IN ('r', 'm')
