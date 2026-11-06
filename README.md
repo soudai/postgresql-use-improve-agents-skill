@@ -9,6 +9,7 @@ PostgreSQL 18・19の統計情報、実行計画、ログを使い、改善す�
 - `sql/`: 読み取り用の収集SQLと、その依存ビューを記録するマニフェスト。
 - `scripts/`: スナップショット収集、待機サンプリング、区間差分、変更前後の比較、実行計画、JSONログ、アプリtraceの解析。
 - `skills/postgres-config-tuning/`: 設定（postgresql.conf・ロール単位・parameter group）の見直しと変更計画を作る別スキル。
+- `skills/postgres-security-review/`: ロール・RLS・認証・実行環境・更新状況をアクセス契約と照合し、改善と復旧を検証する別スキル。
 
 統計から出せるのは調査候補です。Seq Scan、低ヒット率、高い実行回数だけで異常とは判定せず、実行計画やアプリの情報で原因を確認します。DDL・設定変更・セッション終了を自動適用するツールではありません。
 
@@ -155,6 +156,31 @@ PostgreSQL 18.6／19 RC1で実行した統合テストとシナリオの結果�
 [postgres-workload-validation](skills/postgres-workload-validation/SKILL.md)を使って、業務負荷を再生する条件とSLOを揃えます。pgbenchの個別ログやアプリの観測イベントを使い、複数試行の応答時間・処理量・失敗・未送信・結果の一致を比較します。
 
 追加診断の実DB検証は`python tests/followups.py --image postgres:18-bookworm`または`--image postgres:19rc1-bookworm`で実行できます。ローカルのイメージから使い捨てのDBを起動します。
+
+## PostgreSQLのセキュリティをレビューする
+
+[postgres-security-review](skills/postgres-security-review/SKILL.md)は、DBの権限・RLS・認証と、実行環境・パッチ状況を根拠付きでレビューします。DBの読み取り情報と、実アプリが許可される操作や接続経路の契約を照合し、確認できた問題と追加調査が必要な項目を分けます。
+
+```sh
+mkdir -p snapshots reports
+PGSERVICE=security-observer python skills/postgres-security-review/scripts/collect.py --target node-a --database app --output snapshots/app-security.json
+python skills/postgres-security-review/scripts/advisories.py --output snapshots/upstream.json
+python skills/postgres-security-review/scripts/review.py snapshots/app-security.json --contract app-contract.json --advisories snapshots/upstream.json --output reports/app-security.md
+```
+
+契約例、限定した管理者収集、前回比較、公開用Issue案は[収集と入力](skills/postgres-security-review/references/evidence.md)を参照してください。改善案には変更後の許可・拒否の確認と復旧手順を含めます。[検証手順と範囲](skills/postgres-security-review/references/validation.md)には隔離環境でのTLS、権限、バックアップ復元と更新の試験を記載しています。
+
+
+## セキュリティ監査の反例に対する検証
+
+RLSは子テーブルへの直接アクセスも実効ロールと操作ごとに調べ、restrictive policy等の任意の条件式から隔離の保証を断定しません。TLS鍵はmode・所有者だけで合格にせず、サービスの実効読取可否と非承認主体のアクセス確認が必要です。`review.py --as-of`はタイムゾーン付き日時を受け付け、未指定では現在UTC時刻を使います。日付だけを渡した場合、同日中のパスワード失効はunknownです。
+
+```sh
+python tests/security_regressions.py --image postgres:18-bookworm
+python tests/security_regressions.py --image postgres:19rc1-bookworm
+```
+
+試験はネットワークを分離した使い捨てDBで、子のRLSによる許可・拒否、TLS鍵の実効アクセス、失効した資格情報の新規接続拒否を確認します。詳細は[検証手順](skills/postgres-security-review/references/validation.md)を参照してください。
 
 ## テーブル設計をレビューする
 
