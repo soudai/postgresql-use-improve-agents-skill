@@ -1,7 +1,7 @@
 """Authentication, deployment and release evidence checks."""
 import ipaddress
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from urllib.parse import urlsplit
 
 
@@ -127,11 +127,16 @@ def auth(review, access):
                          "Check the external provider's lifecycle where applicable.")
             continue
         fmt = formats.get(role["oid"], "unknown")
-        expired = expiration(role.get("valid_until"), review.today)
+        expired = expiration(role.get("valid_until"), review.as_of)
         if fmt in {"md5", "none"} or expired:
             auth_finding(review, "PASSWORD", name, "finding",
                          {"format": fmt, "expired": expired},
                          "Password logins use a modern verifier and valid credentials.")
+        elif fmt == "scram" and expired is None:
+            auth_finding(review, "PASSWORD", name, "unknown",
+                         {"format": fmt, "expired": None},
+                         "SCRAM format is observed; credential validity needs a timezone-aware evaluation instant.",
+                         confidence="unverified")
         elif fmt == "scram":
             auth_finding(review, "PASSWORD", name, "pass", {"format": fmt, "expired": expired},
                          "Stored verifier uses SCRAM. Strength and lifecycle are assessed separately.")
@@ -153,13 +158,24 @@ def auth(review, access):
                            "Verifier format cannot establish password strength.")
 
 
-def expiration(value, today):
+def expiration(value, as_of):
     if value in (None, "infinity"):
         return False
     if value == "-infinity":
         return True
-    # Day-level assessment avoids treating the remaining time today as expired.
-    return observed_date(value) < today
+    try:
+        until = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if until.tzinfo is None or until.utcoffset() is None:
+        return None
+    until = until.astimezone(timezone.utc)
+    if isinstance(as_of, datetime):
+        return until < as_of
+    # A date denotes a whole UTC day, not midnight. Same-day validity is unknown.
+    if until.date() == as_of:
+        return None
+    return until.date() < as_of
 
 
 def auth_finding(review, rule, subject, status, evidence, expected, confidence="observed"):
@@ -201,12 +217,12 @@ def runtime(review):
             runtime_finding(review, "FILE_ACCESS", label, True, {"kind": kind},
                             "Only approved principals can access the asset.")
             continue
+        if kind == "tls_key":
+            tls_key(review, file, process_uid)
+            continue
         if file.get("platform") == "unix" and re.fullmatch(r"[0-7]{3,4}", file.get("mode", "")):
             mode = int(file["mode"], 8)
-            if kind == "tls_key":
-                correct = (file.get("owner_uid") == 0 and mode in {0o600, 0o640}
-                           or type(process_uid) is int and file.get("owner_uid") == process_uid and mode == 0o600)
-            elif kind == "pgpass":
+            if kind == "pgpass":
                 correct = mode & 0o077 == 0 and file.get("owner_uid") == file.get("service_uid")
                 if file.get("owner_uid") is None or file.get("service_uid") is None:
                     review.missing("FILE_ACCESS", label, "File owner and client OS identity")
@@ -230,6 +246,37 @@ def runtime(review):
         if item["kind"] in {"argv", "environment", "dsn", "ci_log", "config", "fdw", "subscription"}:
             runtime_finding(review, "SECRET_LOCATION", item["kind"], True, "Operator reported an exposed secret location.",
                             "Credentials are handled by an approved secret distribution path.")
+
+
+def tls_key(review, file, process_uid):
+    """Mode/owner suitability does not prove effective readability or reader scope."""
+    evidence = {k: file[k] for k in ("kind", "platform", "mode", "owner_uid", "owner_gid",
+                                    "service_readable", "unauthorized_access") if k in file}
+    expected = "PostgreSQL can read its key and only approved principals can access it."
+    if file.get("service_readable") is False:
+        runtime_finding(review, "FILE_ACCESS", file["id"], True, evidence, expected)
+        return
+    if file.get("platform") not in {"unix", "windows"}:
+        review.missing("FILE_ACCESS", file["id"], "Supported key platform: unix or windows")
+        return
+    if file.get("platform") == "unix":
+        if (not re.fullmatch(r"[0-7]{3,4}", file.get("mode", ""))
+                or type(file.get("owner_uid")) is not int or type(process_uid) is not int):
+            review.missing("FILE_ACCESS", file["id"], "Key mode, owner and PostgreSQL service identity")
+            return
+        mode = int(file["mode"], 8)
+        suitable = (file["owner_uid"] == 0 and mode in {0o600, 0o640}
+                    or file["owner_uid"] == process_uid and mode == 0o600)
+        if not suitable:
+            runtime_finding(review, "FILE_ACCESS", file["id"], True, evidence, expected)
+            return
+    if file.get("service_readable") is True and file.get("unauthorized_access") is False:
+        runtime_finding(review, "FILE_ACCESS", file["id"], False, evidence, expected)
+    else:
+        review.add("FILE_ACCESS", file["id"], "unknown", "unrated", evidence, expected,
+                   "Check effective service readability and approved readers, including groups, ACLs and parent directories.",
+                   "Use scoped access checks without reading key contents; test TLS startup in isolation.",
+                   "Record owners, groups and ACLs before changing access.", confidence="unverified")
 
 
 def runtime_finding(review, rule, subject, risk, evidence, expected):

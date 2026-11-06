@@ -32,7 +32,7 @@ class Review:
         return all(self.sections.get(name, {}).get("status") == "ok" for name in names)
 
     def add(self, rule, subject, status, severity, evidence, expected, improvement, verify, restore,
-            confidence="observed"):
+            confidence="observed", source=None):
         key = json.dumps([rule, self.scope["target"], self.scope["database"], subject],
                          ensure_ascii=False, separators=(",", ":"))
         self.findings[key] = {
@@ -40,6 +40,8 @@ class Review:
             "confidence": confidence, "evidence": evidence, "expected": expected,
             "improvement": improvement, "verify": verify, "restore": restore,
         }
+        if source is not None:
+            self.findings[key]["source"] = source
 
     def missing(self, rule, subject, expected, evidence="Required evidence is missing or incomplete."):
         self.add(rule, subject, "unknown", "unrated", evidence, expected,

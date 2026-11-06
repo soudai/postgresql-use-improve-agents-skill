@@ -168,3 +168,15 @@ python skills/postgres-security-review/scripts/review.py snapshots/app-security.
 ```
 
 契約例、限定した管理者収集、前回比較、公開用Issue案は[収集と入力](skills/postgres-security-review/references/evidence.md)を参照してください。改善案には変更後の許可・拒否の確認と復旧手順を含めます。[検証手順と範囲](skills/postgres-security-review/references/validation.md)には隔離環境でのTLS、権限、バックアップ復元と更新の試験を記載しています。
+
+
+## セキュリティ監査の反例に対する検証
+
+RLSは子テーブルへの直接アクセスも実効ロールと操作ごとに調べ、restrictive policy等の任意の条件式から隔離の保証を断定しません。TLS鍵はmode・所有者だけで合格にせず、サービスの実効読取可否と非承認主体のアクセス確認が必要です。`review.py --as-of`はタイムゾーン付き日時を受け付け、未指定では現在UTC時刻を使います。日付だけを渡した場合、同日中のパスワード失効はunknownです。
+
+```sh
+python tests/security_regressions.py --image postgres:18-bookworm
+python tests/security_regressions.py --image postgres:19rc1-bookworm
+```
+
+試験はネットワークを分離した使い捨てDBで、子のRLSによる許可・拒否、TLS鍵の実効アクセス、失効した資格情報の新規接続拒否を確認します。詳細は[検証手順](skills/postgres-security-review/references/validation.md)を参照してください。

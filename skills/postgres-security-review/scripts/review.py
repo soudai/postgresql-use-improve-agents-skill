@@ -65,8 +65,15 @@ def make_report(snapshot, contract, today, advisories=None, previous=None):
     if contract and (contract.get("target") != snapshot["target"] or
                      contract.get("database") != snapshot["identity"]["database"]):
         raise ValueError("contract scope mismatch")
+    evaluated_at = today
+    if isinstance(evaluated_at, datetime):
+        if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+            raise ValueError("evaluation timestamp requires a timezone")
+        evaluated_at = evaluated_at.astimezone(timezone.utc)
+        today = evaluated_at.date()
     review = Review(snapshot, contract)
     review.today = today
+    review.as_of = evaluated_at
     review.advisories = advisories
     stale = not 0 <= (today - observed_date(snapshot["collected_at"])).days <= 7
     if stale:
@@ -87,8 +94,8 @@ def make_report(snapshot, contract, today, advisories=None, previous=None):
     components(review)
     exceptions = {e["id"]: e for e in contract.get("exceptions", [])}
     for key, f in review.findings.items():
-        f["source"] = SOURCES[f["rule"]]
-        f["evaluated_on"] = today.isoformat()
+        f.setdefault("source", SOURCES[f["rule"]])
+        f["evaluated_on"] = evaluated_at.isoformat()
         f["server_version"] = snapshot["identity"]["version"]
         if stale and f["status"] == "pass":
             f["status"] = "unknown"
@@ -119,6 +126,17 @@ def make_report(snapshot, contract, today, advisories=None, previous=None):
     return report
 
 
+def evaluation_time(value):
+    """Accept a UTC calendar day or an ISO 8601 instant with an explicit offset."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("evaluation timestamp requires a timezone")
+        return instant.astimezone(timezone.utc)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
@@ -126,7 +144,8 @@ def main():
     parser.add_argument("--supplement", type=Path)
     parser.add_argument("--advisories", type=Path)
     parser.add_argument("--previous", type=Path)
-    parser.add_argument("--as-of", type=date.fromisoformat)
+    parser.add_argument("--as-of", type=evaluation_time,
+                        help="ISO timestamp with timezone (default: current UTC time), or UTC date")
     parser.add_argument("--format", choices=("markdown", "json", "issue"), default="markdown")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -138,7 +157,7 @@ def main():
         snapshot = read(args.snapshot)
         if args.supplement:
             snapshot = combine(snapshot, read(args.supplement))
-        report = make_report(snapshot, read(args.contract) or {}, args.as_of or datetime.now(timezone.utc).date(),
+        report = make_report(snapshot, read(args.contract) or {}, args.as_of or datetime.now(timezone.utc),
                              read(args.advisories), read(args.previous))
         write_new(args.output, render(report, args.format))
     except (OSError, ValueError, AttributeError, KeyError, TypeError, IndexError):
