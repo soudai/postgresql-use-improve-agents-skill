@@ -18,17 +18,23 @@ catalogのテーブル・列・制約・索引と、見える範囲のNULL統計
 
 ## snapshot形式
 
-`schema_version: 1`、`metadata`、`sections` を持つJSON。sectionは `tables / columns / constraints / indexes / statistics`。各sectionは `{"status":"ok","truncated":false,"rows":[]}` を基本とする。
+`schema_version: 2`、`metadata`、`sections` を持つJSON。sectionは `tables / columns / constraints / indexes / statistics`。各sectionは `{"status":"ok","truncated":false,"rows":[]}` を基本とする。
 
-- tables: `relation, schema, name, kind, partition`。通常表とpartitioned tableを対象とする。
-- columns: `relation, name, type, not_null, domain_has_check, has_default, identity, generated`。
-- constraints: `relation, name, type, columns, referenced_relation, referenced_columns, validated, enforced, match_type, update_action, delete_action`。
+- tables: `relation, schema, name, kind, partition, has_inheritance_children`。通常表とpartitioned tableを対象とする。has_inheritance_childrenは宣言的partition以外の通常継承子の存在を示す。
+- columns: `relation, name, type, column_not_null, domain_not_null, domain_has_check, has_default, identity, generated`。
+- constraints: `relation, name, type, columns, referenced_relation, referenced_columns, validated, enforced, no_inherit, match_type, update_action, delete_action`。
 - indexes: `relation, name, columns, unique, valid, partial, expression`。
 - statistics: `relation, column, null_frac`。統計上の推定で、列の必須性を保証しない。
 
 `relation` はcatalogが出力したschema修飾識別子をそのまま使用する。例は `public.orders`、大文字やドットを含む名前は `public."Order.Items"`。文字列をドットで分割しない。FKの列配列は対応順を保持する。制約typeは `p/u/f/c/n`、参照動作は `a/r/c/n/d`（NO ACTION/RESTRICT/CASCADE/SET NULL/SET DEFAULT）、MATCHは `s/f/p`。
 
-既存DDLだけを使う場合は、許可された隔離DBへ適用して収集するか、確認できた事実をこの形式に変換する。入力値の式を実行しない。未知の属性を推測で補わず欠測として記録する。not_nullは列とdomain階層のNOT NULLを反映する。domain_has_checkはdomain階層にCHECKがあることだけを示し、式がNULLを禁止するかは追加確認する。
+既存DDLだけを使う場合は、許可された隔離DBへ適用して収集するか、確認できた事実をこの形式に変換する。入力値の式を実行しない。未知の属性を推測で補わず欠測として記録する。column_not_nullは列のattnotnull、domain_not_nullはdomain階層のtypnotnullを表す。列のNULL禁止保証はcolumn_not_nullに加え、対応するNOT NULLまたはPRIMARY KEY制約のvalidated/enforcedがともにtrueの場合に確認する。制約の存在・新規書込みへの強制・既存行の検証を区別し、属性の欠測はunknownとして残す。これはまず親自身の行に対する局所保証であり、通常継承子がある場合や子の有無が欠測した場合、子を含む保証へ昇格させない。
+
+親への通常のSELECTは継承子を含む。NOT NULL NO INHERITは子へ伝播せず、PRIMARY KEYの一意性やFKの参照整合性も通常継承子の行へ伝播しない。親のMATCH FULLと列NOT NULLだけから、子を含む全行の必須性を推論しない。子ごとの制約と契約適用範囲を照合する。[継承の制約範囲](https://www.postgresql.org/docs/18/ddl-inherit.html#DDL-INHERIT-CAVEATS)、[NOT NULL NO INHERIT](https://www.postgresql.org/docs/18/sql-createtable.html)
+
+domainのNOT NULLは型変換時の検査であり、空のスカラー副問い合わせなどから得たdomain型のNULLが保存される場合がある。domain_has_checkもCHECKの存在だけを示し、列の保証へ読み替えない。[CREATE DOMAINの注意事項](https://www.postgresql.org/docs/18/sql-createdomain.html#SQL-CREATEDOMAIN-NOTES)
+
+旧snapshot v1も読める。not_null=falseは列NOT NULLがない証拠として扱うが、trueは列/domainの由来と検証状態を区別できないため、列保証に昇格せずv2で再収集する。契約・観測入力とレポートのschema_versionは1のまま。レポートのsnapshot_versionに入力版を記録する。
 
 ## 設計契約
 
@@ -46,14 +52,14 @@ catalogのテーブル・列・制約・索引と、見える範囲のNULL統計
 | flags | columns、meaning（boolean/state/event/derived/soft_delete）、必要ならsource_column、違反判定のinvariant |
 | exceptions | rule、reason、sourceを持つ明示的な例外 |
 
-契約の出典がなければ解釈は未確定。外部ID・非同期整合性などでFKを設けない関連は `enforce:false` と理由の出典を記録する。この場合、外部の参照先名・列名が不明ならreferenced_relation/referenced_columnsを省略できる。例外は期限や再確認条件も業務資料に残す。用語集は `vocabulary.terms` と `vocabulary.allowed_abbreviations` を補助情報として保持できる。綴りの類似度から自動改名しない。
+契約の出典がなければ解釈は未確定。外部ID・非同期整合性などでFKを設けない関連は `enforce:false` と理由の出典を記録する。この場合、外部の参照先名・列名が不明ならreferenced_relation/referenced_columnsを省略できる。allow_null:falseはFKを設けない場合も独立した必須性の契約として評価する。例外は期限や再確認条件も業務資料に残す。用語集は `vocabulary.terms` と `vocabulary.allowed_abbreviations` を補助情報として保持できる。綴りの類似度から自動改名しない。
 
 ## 観測情報
 
 [evidenceの例](../assets/evidence.example.json)の `writes / profiles / contention` を使う。空配列は未観測として扱い、正常の証明にしない。レポートのobservationsは入力レコード数であり、実際のSQL実行回数ではない。v1は入力された観測の照合を行う。リポジトリ全体の自動SQL解析や本番データの集計実行は提供しない。
 
 - writes: `relation, operation, columns, business_operation, after_finalization, source, observed_at`。operationはINSERT/UPDATE/DELETE/TRUNCATE。ORM/migration/実SQLから、更新対象の列群と業務操作を対応付ける。ORMが全列更新する場合、実際の変更列はtraceや業務処理から補う。`after_finalization:true` は実行を観測し確定後だと確認した操作にだけ使う。静的コードから「起こり得る」と推測した処理は確定後の実行観測として扱わない。
-- profiles: `relation, kind, columns, violations, rows_checked, scope, complete, source, observed_at`。kindはnull/flag_combination。flagの違反は契約のinvariantと対応付ける。violationsは業務契約に違反する件数で、単純なNULL総数やfalseの件数ではない。completeは記載したscopeの採取完了を表す。v1のrequired_columnsは常時必須だけを表すため、条件付き必須のNULL集計は要追加調査となり、状態条件を資料と照合してレポートへ補足する。
+- profiles: `relation, kind, columns, violations, rows_checked, scope, complete, source, observed_at`と任意の`includes_children`。kindはnull/flag_combination。flagの違反は契約のinvariantと対応付ける。violationsは業務契約に違反する件数で、単純なNULL総数やfalseの件数ではない。completeは記載したscopeの採取完了を表す。通常継承親のNULL集計は、子を含むSELECTなら`includes_children: true`、ONLYならfalseを記録する。省略時は範囲を要確認とし、scopeの自由文から自動推測しない。子を含むNULL実測を親の局所制約と矛盾するとは扱わない。複数列の違反集計も、1列のNULL禁止だけで他列のNULLを否定しない。v1のrequired_columnsは常時必須だけを表すため、条件付き必須のNULL集計は要追加調査となり、状態条件を資料と照合してレポートへ補足する。
 - contention: `relation, operations, same_key, wait_ms, blocker_chain, transaction_boundary, source, observed_at`。同じ対象キーの競合、業務操作、blockerの連鎖とtransaction境界を、時刻の揃ったtrace等で確認する。writesの業務操作・列群と同じtrace期間・transactionを照合する。transaction_boundary:trueはその対応を確認済みであることを表す。v1はtrace相関IDからこの対応を自動検証しない。値やキーそのものはこの形式へ転記しない。
 
 sourceと観測時刻を伴う情報で確度を評価する。異なる環境・古いsnapshot・DDL変更前のtraceを混在させず、対象と観測期間をレポートに示す。統計収集のresetとデプロイの境界も確認する。

@@ -158,7 +158,7 @@ class ChainAndPlanTests(unittest.TestCase):
         self.assertFalse(plan["uses_parameter_placeholders"])
         generic = {"Plan": {"Node Type": "Index Scan", "Index Cond": "(status = $1)", "Plan Rows": 30,
                             "Actual Rows": 270000, "Actual Loops": 1}}
-        plan = PLAN.analyze(generic)["plans"][0]
+        plan = PLAN.analyze(generic, plan_mode="generic", plan_source="fixture: forced generic EXPLAIN EXECUTE")["plans"][0]
         self.assertTrue(plan["uses_parameter_placeholders"])
         self.assertIn("generic_plan_misestimate", [c["kind"] for c in plan["candidates"]])
         self.assertNotIn("status = $1", json.dumps(plan))

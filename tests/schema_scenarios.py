@@ -83,6 +83,13 @@ CREATE DOMAIN nested_checked_integer AS checked_integer;
 CREATE TABLE checked_domain_values (id int PRIMARY KEY, required_value nested_checked_integer);
 INSERT INTO checked_domain_values VALUES (1,7);
 INSERT INTO domain_values VALUES (1, 7);
+-- A typed NULL bypasses a domain conversion check, unlike a column constraint.
+INSERT INTO domain_values VALUES (2, (SELECT required_value FROM domain_values WHERE false));
+CREATE TABLE required_unvalidated (id int PRIMARY KEY, required_value int);
+INSERT INTO required_unvalidated VALUES (1, NULL);
+ALTER TABLE required_unvalidated ADD CONSTRAINT required_value_nn NOT NULL required_value NOT VALID;
+CREATE TABLE external_refs (id int PRIMARY KEY, external_customer_id text);
+INSERT INTO external_refs VALUES (1, NULL);
 CREATE TABLE expression_values (id int PRIMARY KEY, marker text DEFAULT '""" + CANARY + """',
                                 CHECK (marker IS DISTINCT FROM '""" + CANARY + """'));
 INSERT INTO expression_values VALUES (1, 'ordinary');
@@ -107,10 +114,23 @@ def catalog_and_constraints(cluster, directory):
     rows = lambda name: snapshot["sections"][name]["rows"]
     assert any(r["relation"] == 'public."Order.Items"' for r in rows("tables")), rows("tables")
     assert any(r["relation"] == 'public."Order.Items"' and r["name"] == "User.ID" for r in rows("columns"))
-    assert any(r["relation"] == "public.domain_values" and r["name"] == "required_value" and r["not_null"]
+    assert any(r["relation"] == "public.domain_values" and r["name"] == "required_value" and r["domain_not_null"] and not r["column_not_null"]
                for r in rows("columns"))
     assert any(r["relation"] == "public.orders_unvalidated" and r["type"] == "f"
                and not r["validated"] and r["enforced"] for r in rows("constraints"))
+    assert snapshot["schema_version"] == 2
+    assert any(r["relation"] == "public.required_unvalidated" and r["type"] == "n"
+               and r["columns"] == ["required_value"] and not r["validated"] and r["enforced"]
+               for r in rows("constraints"))
+    assert cluster.value("SELECT count(*) FROM domain_values WHERE required_value IS NULL") == "1"
+    assert cluster.value("SELECT count(*) FROM required_unvalidated WHERE required_value IS NULL") == "1"
+    for statement in (
+        "INSERT INTO domain_values VALUES (3, NULL);",
+        "INSERT INTO required_unvalidated VALUES (2, NULL);",
+        "ALTER TABLE required_unvalidated VALIDATE CONSTRAINT required_value_nn;"):
+        denied = run(["docker", "exec", "-i", cluster.name, "psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
+                     sql=statement, check=False)
+        assert denied.returncode != 0, statement
     tables = [relation_contract("public." + name)
               for name in ("orders_missing", "orders_wrong", "orders_unvalidated")]
     full_contract = relation_contract("public.full_link")
@@ -133,6 +153,10 @@ def catalog_and_constraints(cluster, directory):
                    {"columns": ["is_featured"], "meaning": "boolean"}]},
         {"relation": "public.domain_values", "source": "integration/required-domain",
          "required_columns": ["required_value"]},
+        {"relation": "public.required_unvalidated", "source": "integration/required-unvalidated",
+         "required_columns": ["required_value"]},
+        {"relation": "public.external_refs", "source": "integration/external-id-required",
+         "relationships": [{"columns": ["external_customer_id"], "enforce": False, "allow_null": False}]},
         {"relation": "public.checked_domain_values", "source": "integration/required-domain-check",
          "required_columns": ["required_value"]},
     ])
@@ -143,13 +167,28 @@ def catalog_and_constraints(cluster, directory):
         "rows_checked": int(cluster.value("SELECT count(*) FROM nullable_check")),
         "scope": "all synthetic nullable_check rows", "complete": True,
         "source": "integration/required-amount-profile", "observed_at": now()}]}
+    for table, column in (("domain_values", "required_value"),
+                          ("required_unvalidated", "required_value"),
+                          ("external_refs", "external_customer_id")):
+        evidence["profiles"].append({
+            "relation": "public." + table, "kind": "null", "columns": [column],
+            "violations": int(cluster.value(f"SELECT count(*) FROM {table} WHERE {column} IS NULL")),
+            "rows_checked": int(cluster.value(f"SELECT count(*) FROM {table}")),
+            "scope": "all synthetic rows in public." + table, "complete": True,
+            "source": "integration/null-profile/" + table, "observed_at": now()})
     report = review(path, contract, evidence, directory, "before")
     for relation in ("orders_missing", "orders_wrong", "orders_unvalidated"):
         assert findings(report, "public." + relation, "schema.fk", "confirmed"), report
     assert findings(report, "public.nullable_check", "schema.null", "confirmed"), report
     assert not findings(report, "public.nullable_link", "schema.fk"), report
     assert not findings(report, "public.flags_ok", "schema.flag"), report
-    assert not findings(report, "public.domain_values", "schema.null"), report
+    for table in ("domain_values", "required_unvalidated", "external_refs"):
+        null_findings = findings(report, "public." + table, "schema.null")
+        assert len(null_findings) == 2 and all(f["status"] == "confirmed" for f in null_findings), report
+        assert any("集計" in f["summary"] for f in null_findings), report
+    assert any("未検証" in f["summary"]
+               for f in findings(report, "public.required_unvalidated", "schema.null")), report
+    assert findings(report, "public.external_refs", "schema.fk", "exception"), report
     assert findings(report, "public.checked_domain_values", "schema.null", "candidate"), report
     assert not findings(report, "public.checked_domain_values", "schema.null", "confirmed"), report
     rejected_domain = run(["docker","exec","-i",cluster.name,"psql","-XqAt","-v","ON_ERROR_STOP=1"],
@@ -173,6 +212,12 @@ ALTER TABLE orders_wrong VALIDATE CONSTRAINT expected_fk;
 ALTER TABLE orders_unvalidated VALIDATE CONSTRAINT expected_fk;
 UPDATE nullable_check SET amount = 1 WHERE amount IS NULL;
 ALTER TABLE nullable_check ALTER COLUMN amount SET NOT NULL;
+UPDATE domain_values SET required_value = 7 WHERE required_value IS NULL;
+ALTER TABLE domain_values ALTER COLUMN required_value SET NOT NULL;
+UPDATE required_unvalidated SET required_value = 7 WHERE required_value IS NULL;
+ALTER TABLE required_unvalidated VALIDATE CONSTRAINT required_value_nn;
+UPDATE external_refs SET external_customer_id = 'customer-1' WHERE external_customer_id IS NULL;
+ALTER TABLE external_refs ALTER COLUMN external_customer_id SET NOT NULL;
 """)
     # Check the tenant mismatch is rejected by the added composite constraint.
     denied = run(["docker", "exec", "-i", cluster.name, "psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
@@ -185,7 +230,16 @@ ALTER TABLE nullable_check ALTER COLUMN amount SET NOT NULL;
     for relation in ("orders_missing", "orders_wrong", "orders_unvalidated"):
         assert not findings(repaired, "public." + relation, "schema.fk"), repaired
     assert not findings(repaired, "public.nullable_check", "schema.null"), repaired
-    print("Catalog, quoted names, effective domain NOT NULL and FK repair passed", flush=True)
+    for table in ("domain_values", "required_unvalidated", "external_refs"):
+        assert not findings(repaired, "public." + table, "schema.null"), repaired
+    assert findings(repaired, "public.external_refs", "schema.fk", "exception"), repaired
+    denied_typed_null = run(
+        ["docker", "exec", "-i", cluster.name, "psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
+        sql="INSERT INTO domain_values VALUES (3,(SELECT required_value FROM domain_values WHERE false));",
+        check=False)
+    assert denied_typed_null.returncode != 0
+    print("Catalog, quoted names, domain NULL, NOT VALID, external requiredness and FK repair passed",
+          flush=True)
     return contract
 
 
@@ -272,6 +326,56 @@ INSERT INTO order_shipments VALUES (1, NULL);
         shipment.close()
 
 
+
+def inheritance_scope(cluster, directory):
+    cluster.psql("""
+CREATE TABLE inherited_nn(value int NOT NULL NO INHERIT);
+CREATE TABLE inherited_nn_child() INHERITS(inherited_nn);
+INSERT INTO inherited_nn_child VALUES(NULL);
+CREATE TABLE inherited_pk(value int PRIMARY KEY);
+CREATE TABLE inherited_pk_child() INHERITS(inherited_pk);
+INSERT INTO inherited_pk VALUES(1);
+INSERT INTO inherited_pk_child VALUES(1);
+CREATE TABLE inherited_full(a int NOT NULL, b int,
+    PRIMARY KEY(a), FOREIGN KEY(a,b) REFERENCES customers(tenant_id,id) MATCH FULL);
+CREATE TABLE inherited_full_child() INHERITS(inherited_full);
+INSERT INTO inherited_full_child VALUES(1,NULL);
+""")
+    snapshot, path = collect(cluster, directory, "inheritance")
+    for name in ("inherited_nn", "inherited_pk", "inherited_full"):
+        assert any(r["relation"] == "public." + name and r["has_inheritance_children"]
+                   for r in snapshot["sections"]["tables"]["rows"])
+    assert any(r["relation"] == "public.inherited_nn" and r["type"] == "n" and r["no_inherit"]
+               for r in snapshot["sections"]["constraints"]["rows"])
+    # PK uniqueness is parent-local, while its column NOT NULL still propagates.
+    assert cluster.value("SELECT count(*) FROM inherited_pk WHERE value=1") == "2"
+    rejected = run(["docker", "exec", "-i", cluster.name, "psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
+                   sql="INSERT INTO inherited_pk_child VALUES(NULL)", check=False)
+    assert rejected.returncode != 0
+    contract = {"schema_version": 1, "tables": []}
+    evidence = {"schema_version": 1, "profiles": []}
+    for table, column in (("inherited_nn", "value"), ("inherited_full", "b")):
+        assert cluster.value(f"SELECT count(*) FROM ONLY {table} WHERE {column} IS NULL") == "0"
+        assert cluster.value(f"SELECT count(*) FROM {table} WHERE {column} IS NULL") == "1"
+        contract["tables"].append({"relation": "public." + table, "required_columns": [column],
+                                   "source": "integration/inherited-row-requiredness"})
+        evidence["profiles"].append({
+            "relation": "public." + table, "kind": "null", "columns": [column],
+            "violations": 1, "rows_checked": 1, "scope": "parent SELECT including inheritance children",
+            "includes_children": True, "complete": True,
+            "source": "integration/parent-null-count", "observed_at": now()})
+    result = review(path, contract, evidence, directory, "inheritance")
+    for spec in contract["tables"]:
+        found = findings(result, spec["relation"], "schema.null")
+        assert any(f["status"] == "needs_evidence" and "集計" not in f["summary"] for f in found)
+        assert any(f["status"] == "confirmed" and "集計" in f["summary"] for f in found)
+    for profile in evidence["profiles"]:
+        del profile["includes_children"]
+    unknown = review(path, contract, evidence, directory, "inheritance-unknown-scope")
+    assert all(f["status"] == "needs_evidence" for f in unknown["findings"])
+    print("Parent-local NOT NULL/PK/MATCH FULL and inherited NULL scope passed", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
@@ -288,6 +392,7 @@ def main():
             contract = catalog_and_constraints(cluster, directory)
             bounded_and_low_privilege(cluster, directory, contract)
             contention(cluster, directory)
+            inheritance_scope(cluster, directory)
         finally:
             cluster.stop()
 

@@ -158,8 +158,12 @@ cat {prefix}.[0-9]*
     for path in inputs:
         result = json.loads(run([sys.executable, str(script), str(path), str(path), "--p95-ms", "1000",
                                  "--min-tps", "1", "--max-loss-rate", "0"]).stdout)
-        assert result["decision"] == "accept_candidate", result
-    print("Raw pgbench logs for read and write workloads passed", flush=True)
+        # Short fixture runs exercise parsing, not production acceptance.
+        assert result["decision"] == "investigate", result
+        assert result["correctness"]["status"] == "match", result
+        assert result["performance"]["status"] == "slo_met_in_observed_runs", result
+        assert result["improvement"]["status"] == "not_established", result
+    print("Raw pgbench logs parsed; short unplanned runs require investigation", flush=True)
 
 
 def main():

@@ -11,12 +11,13 @@ import re
 import subprocess
 import sys
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MARKER = "/* postgres-performance-diagnostics */"
 WORKERS = ("client backend", "parallel worker")
 # One autocommit statement per sample: backend status is re-read in every new transaction.
 SAMPLE_SQL = MARKER + """ SELECT jsonb_build_object(
   'at', clock_timestamp(),
+  'track_activities', pg_catalog.current_setting('track_activities'),
   'sessions', COALESCE((SELECT jsonb_agg(jsonb_build_object(
       'pid', a.pid, 'leader_pid', a.leader_pid, 'backend_type', a.backend_type,
       'datname', a.datname, 'application_name', a.application_name,
@@ -35,6 +36,8 @@ LIMITATIONS = [
     "active with no wait event means CPU or an uninstrumented wait; confirm CPU saturation with OS metrics.",
     "Sessions waiting in a connection pool before reaching PostgreSQL are not visible here.",
     "query_id needs compute_query_id; utility statements and some protocol phases may have none.",
+    "Hidden backend state/type and disabled activity tracking make AAS unknown; observed counts are lower bounds.",
+    "Wait/query shares use observed active sessions only, not hidden sessions.",
     "The sampler itself is one extra session; keep intervals >= 1s on production systems.",
 ]
 
@@ -112,11 +115,23 @@ def wait_label(session: dict) -> str:
 def summarize(samples: list, top: int = 20) -> dict:
     count = len(samples)
     waits, background, idle_tx, blockers, queries = Counter(), Counter(), Counter(), Counter(), {}
-    active_per_sample, max_idle_tx_age = [], None
+    active_per_sample, unknown_per_sample, max_idle_tx_age = [], [], None
+    incomplete_reasons = set()
     for sample in samples:
-        active = 0
-        for session in sample.get("sessions", []):
+        active, unknown = 0, 0
+        if sample.get("track_activities") != "on":
+            incomplete_reasons.add("Sampler track_activities is disabled or was not captured.")
+        if not isinstance(sample.get("sessions"), list):
+            incomplete_reasons.add("Session rows are missing.")
+        for session in sample.get("sessions") or []:
             kind = session.get("backend_type")
+            state = session.get("state")
+            # PostgreSQL masks both fields for other roles; do not count these as background.
+            # track_activities can also be disabled per backend, regardless of our own setting.
+            if kind is None or (kind in WORKERS and state in (None, "disabled")):
+                unknown += 1
+                incomplete_reasons.add("Some backend state/type is hidden or activity tracking is disabled.")
+                continue
             if (session.get("state") or "").startswith("idle in transaction"):
                 idle_tx[session.get("datname")] += 1
                 age = session.get("xact_age_s")
@@ -126,7 +141,7 @@ def summarize(samples: list, top: int = 20) -> dict:
             if kind not in WORKERS:
                 background[(kind, wait_label(session))] += 1
                 continue
-            if session.get("state") != "active":
+            if state not in ("active", "fastpath function call"):
                 continue
             active += 1
             label = wait_label(session)
@@ -136,6 +151,8 @@ def summarize(samples: list, top: int = 20) -> dict:
             for pid in session.get("blocking_pids") or []:
                 blockers[pid] += 1
         active_per_sample.append(active)
+        unknown_per_sample.append(unknown)
+    complete = count > 0 and not incomplete_reasons
     total = sum(waits.values())
 
     def share(value):
@@ -143,8 +160,16 @@ def summarize(samples: list, top: int = 20) -> dict:
 
     return {
         "samples": count,
-        "average_active_sessions": total / count if count else None,
-        "peak_active_sessions": max(active_per_sample, default=None),
+        "average_active_sessions": total / count if complete else None,
+        "peak_active_sessions": max(active_per_sample) if complete else None,
+        "observed_average_active_sessions": total / count if count else None,
+        "observed_peak_active_sessions": max(active_per_sample, default=None),
+        "activity_coverage": "complete" if complete else "incomplete",
+        "unknown_session_samples": sum(unknown_per_sample),
+        "samples_with_unknown_sessions": sum(value > 0 for value in unknown_per_sample),
+        "peak_unknown_sessions": max(unknown_per_sample, default=None),
+        "wait_profile_share_scope": "observed_active_sessions",
+        "warnings": sorted(incomplete_reasons),
         "wait_profile": [{"wait": label, "samples": value, "average_sessions": value / count, "share": share(value)}
                          for label, value in waits.most_common(top)],
         "by_query_id": [{"query_id": query_id, "samples": sum(labels.values()),
@@ -175,10 +200,19 @@ def sample(args: argparse.Namespace) -> dict:
 
 def markdown(report: dict) -> str:
     summary = report["summary"]
+    aas = summary["average_active_sessions"] if summary["average_active_sessions"] is not None else "unknown"
+    peak = summary["peak_active_sessions"] if summary["peak_active_sessions"] is not None else "unknown"
     lines = ["# PostgreSQL activity samples", "",
              f"Instance: {report['instance_id']}; samples: {summary['samples']}/{report['requested_samples']} "
              f"every {report['interval_seconds']}s; {report['first_sample_at']} → {report['last_sample_at']}",
-             f"Average active sessions: {summary['average_active_sessions']}; peak: {summary['peak_active_sessions']}", ""]
+             f"Average active sessions: {aas}; peak: {peak}", ""]
+    if summary["activity_coverage"] != "complete":
+        lines += ["Activity coverage: incomplete; AAS and peak are unknown.",
+                  f"Observed lower bounds: AAS {summary['observed_average_active_sessions']}; "
+                  f"peak {summary['observed_peak_active_sessions']}; unknown session-samples "
+                  f"{summary['unknown_session_samples']}.",
+                  "Wait/query shares below describe observed active sessions only.", ""]
+        lines += ["- " + warning for warning in summary["warnings"]] + [""]
     if report.get("error"):
         lines += [f"Sampling stopped early: {report['error']}", ""]
     lines += ["## Wait profile (client backends and parallel workers)", "",

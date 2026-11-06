@@ -175,3 +175,25 @@ python tests/schema_scenarios.py --image postgres:19rc1-bookworm
 ```
 
 検証した範囲と移行時の確認は[変更計画と検証](skills/postgres-schema-review/references/refactoring.md)を参照してください。
+
+
+## 証拠を限定した診断と互換性
+
+不明な情報を0や合格として扱わず、観測した事実と原因の仮説を分けて報告します。
+
+- activity sampleは出力v2です。権限やactivity追跡の不足があるとAAS・peakはnullとなり、観測できた下限と不足理由を別に出します。旧sampleを再集計する場合も追跡状態の証拠がなければ不明になります。
+- 計画の`$n`だけではgeneric planと断定しません。`--plan-mode`と`--plan-source`で採取時の根拠を記録します。BRINのlossy bitmapは本来の性質であり、メモリ不足の証拠とは限りません。`--relation-evidence`で同じ対象の索引方式を補えます。
+- 設定のcheckpoint要求比率は原因の追加調査、JIT比率は同条件ON/OFF試験の候補です。単独の比率から変更値や効果を断定しません。
+- schema snapshot v2は列とdomainのNOT NULL、制約の検証・強制状態を区別します。v1も読めますが、合成された`not_null: true`を列の保証として使わず、再収集を求めます。設計契約・観測情報の形式はv1のままです。
+- workload report v2は正しさ、観測したSLO、証拠の十分性を分けます。旧入力も読めますが、採用候補には`--policy`で代表負荷と試行数・件数・時間・ばらつきの検証計画が必要です。欠測があっても確認できた違反は残し、中央値の差だけでは因果的な改善を断定しません。
+
+監査の反例を再現する追加試験（ローカルの使い捨てDBのみ）:
+
+```sh
+python tests/performance_evidence_scenarios.py --images postgres:18-bookworm
+python tests/performance_evidence_scenarios.py --images postgres:19rc1-bookworm
+python tests/config_workload_evidence_scenarios.py --image postgres:18-bookworm
+python tests/config_workload_evidence_scenarios.py --image postgres:19rc1-bookworm
+```
+
+schemaの反例は`tests/schema_scenarios.py`に含みます。短い負荷試験は診断とログ解析の動作確認であり、本番の性能改善や採用の根拠ではありません。

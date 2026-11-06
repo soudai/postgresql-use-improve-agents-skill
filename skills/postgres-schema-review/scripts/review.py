@@ -91,14 +91,14 @@ def choice(value, path, allowed):
     require(isinstance(value, str) and value in allowed, path, "unsupported value")
 
 
-def document(value, name):
+def document(value, name, versions=(1,)):
     obj(value, name)
-    require(type(value.get("schema_version")) is int and value["schema_version"] == 1,
-            name + ".schema_version", "expected version 1")
+    require(type(value.get("schema_version")) is int and value["schema_version"] in versions,
+            name + ".schema_version", "unsupported version; expected " + "/".join(map(str,versions)))
 
 
 def validate_snapshot(snapshot):
-    document(snapshot, "snapshot")
+    document(snapshot, "snapshot", (1,2))
     obj(snapshot.get("sections"), "snapshot.sections")
     obj(snapshot.get("metadata", {}), "snapshot.metadata")
     for name in SECTIONS:
@@ -121,9 +121,14 @@ def validate_snapshot(snapshot):
                 string(row.get("schema"), path+".row.schema")
                 choice(row.get("kind"), path+".row.kind", ("r", "p"))
                 optional(row, "partition", boolean, path)
+                optional(row, "has_inheritance_children", boolean, path)
             if name == "columns":
                 string(row.get("type"), path+".row.type")
-                boolean(row.get("not_null"), path+".row.not_null")
+                if snapshot["schema_version"] == 1:
+                    boolean(row.get("not_null"), path+".row.not_null")
+                else:
+                    boolean(row.get("column_not_null"), path+".row.column_not_null")
+                    boolean(row.get("domain_not_null"), path+".row.domain_not_null")
                 optional(row, "has_default", boolean, path)
                 optional(row, "domain_has_check", boolean, path)
             if name == "constraints":
@@ -131,6 +136,7 @@ def validate_snapshot(snapshot):
                 strings(row.get("columns", []), path+".row.columns")
                 optional(row, "validated", boolean, path)
                 optional(row, "enforced", boolean, path)
+                optional(row, "no_inherit", boolean, path)
                 if row["type"] == "f":
                     string(row.get("referenced_relation"), path+".row.referenced_relation")
                     strings(row.get("referenced_columns"), path+".row.referenced_columns", True)
@@ -235,7 +241,8 @@ def validate_evidence(evidence):
             p = "evidence."+section+"[]"
             allowed = {
                 "writes": ("relation","operation","columns","business_operation","after_finalization","source","observed_at"),
-                "profiles": ("relation","kind","columns","violations","rows_checked","scope","complete","source","observed_at"),
+                "profiles": ("relation","kind","columns","violations","rows_checked","scope","complete","source","observed_at",
+                             "includes_children"),
                 "contention": ("relation","operations","same_key","wait_ms","blocker_chain","transaction_boundary","source","observed_at"),
             }
             fields(item, p, allowed[section])
@@ -256,6 +263,7 @@ def validate_evidence(evidence):
                 require(item["violations"] <= item["rows_checked"], p, "violations exceed checked rows")
                 string(item.get("scope"), p+".scope")
                 optional(item, "complete", boolean, p)
+                optional(item, "includes_children", boolean, p)
             else:
                 optional(item, "operations", strings, p)
                 optional(item, "wait_ms", number, p)
@@ -328,13 +336,16 @@ def review(snapshot, contract=None, evidence=None):
         "正規化した証拠のsourceは参照位置です。自動で内容を取得・検証しません。",
         "observationsは入力レコード数です。静的な書込箇所も含み、実行観測件数ではありません。",
     ]
+    if snapshot["schema_version"] == 1:
+        limits.append("snapshot v1のnot_null=trueは列制約とdomainの由来・検証状態が不明です。"
+                      "NULL禁止の保証を確定せず、v2 collectorで再収集してください。")
     for name, part in coverage.items():
         if part["status"] != "ok" or part["truncated"]:
             limits.append(name+": incomplete catalog evidence")
     for relation in sorted(relations-set(contracts)):
         limits.append(relation+": 業務上の設計契約が未入力です。")
     return {
-        "schema_version":1, "scope":{
+        "schema_version":1, "snapshot_version":snapshot["schema_version"], "scope":{
             k:snapshot.get("metadata",{}).get(k) for k in
             ("database","server_version_num","collected_at","requested_schemas")
         },

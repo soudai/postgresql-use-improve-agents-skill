@@ -626,8 +626,24 @@ VACUUM ANALYZE;
             script += [f"\\echo @@{mode}:{v}\nEXPLAIN (ANALYZE, FORMAT JSON) EXECUTE s9q('{v}');" for v in values]
         script += ["SET plan_cache_mode = auto;", "DEALLOCATE s9q;", script[1], "\\echo @@warmup"]
         # Prime the new prepared statement with the common value, then switch to a rare one.
-        script += ["EXECUTE s9q('done');"] * 5 + ["\\echo @@auto:pending\nEXPLAIN (ANALYZE, FORMAT JSON) EXECUTE s9q('pending');"]
-        plans = {k: PLAN.analyze(json.loads(v))["plans"][0] for k, v in blocks(self.c.psql("\n".join(script))).items() if ":" in k}
+        script += ["EXECUTE s9q('done');"] * 5
+        counter_sql = ("SELECT jsonb_build_object('generic', generic_plans, 'custom', custom_plans) "
+                       "FROM pg_prepared_statements WHERE name = 's9q';")
+        script += ["\\echo @@auto_before", counter_sql,
+                   "\\echo @@auto:pending\nEXPLAIN (ANALYZE, FORMAT JSON) EXECUTE s9q('pending');",
+                   "\\echo @@auto_after", counter_sql]
+        captured = blocks(self.c.psql("\n".join(script)))
+        before_mode, after_mode = (json.loads(captured[key]) for key in ("auto_before", "auto_after"))
+        auto_mode = next((mode for mode in ("generic", "custom")
+                          if after_mode[mode] - before_mode[mode] == 1), "unknown")
+        plans = {}
+        for key, value in captured.items():
+            if ":" not in key:
+                continue
+            mode = auto_mode if key.startswith("auto:") else key.split(":")[0].removeprefix("force_").removesuffix("_plan")
+            source = ("scenarios.py: pg_prepared_statements counter delta around EXPLAIN EXECUTE"
+                      if key.startswith("auto:") else "scenarios.py: EXPLAIN EXECUTE under " + key.split(":")[0])
+            plans[key] = PLAN.analyze(json.loads(value), plan_mode=mode, plan_source=source)["plans"][0]
         generic_rare = plans["force_generic_plan:pending"]
         self.check("generic plan regression detected for a rare value",
                    "generic_plan_misestimate" in kinds(generic_rare) and generic_rare["uses_parameter_placeholders"], sorted(kinds(generic_rare)))

@@ -25,6 +25,14 @@ soudaiさんが参照する[川島さんのイミュータブルデータモデ�
 
 FKの子側に索引がないことは、制約が存在しないこととは別の性能調査項目。参照先の一意性、複合キーの列対応、NULLのMATCH規則を確認する。CHECKは評価結果がNULLでも成立するため、CHECKがあるだけで必須性が保証されるとは扱わない。[制約仕様](https://www.postgresql.org/docs/18/ddl-constraints.html)
 
+NULLの保証は次のように評価する。
+
+- domain NOT NULLと列NOT NULLを分ける。domainの型変換時の検査は、既にdomain型となったNULLの保存を防がない場合がある。[CREATE DOMAIN](https://www.postgresql.org/docs/18/sql-createdomain.html#SQL-CREATEDOMAIN-NOTES)
+- NOT NULL NOT VALIDは新規INSERT/UPDATEを検査するが、既存行のNULLが残り得る。validated=falseの事実と、実際に観測したNULL件数を分けて報告する。既存行の修復とVALIDATE後の再収集まで保証を確定しない。[ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html)
+- MATCH FULLは部分NULLを拒否するが、全列NULLを許す。全列の必須性を推論するには、検証・強制済みのFKと、少なくとも1列の検証・強制済みの列NOT NULLが必要。domainや未検証のNOT NULLをその根拠にしない。[FKのNULL仕様](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK)
+- enforce:falseはFKを設けない意図だけを表す。allow_null:falseは別に評価し、FKの例外で必須性の指摘を消さない。
+- 検証済みの列保証とNULL実測が矛盾した場合だけ、環境・観測時点を再照合する。domainや未検証制約とNULL実測の併存は矛盾ではない。
+
 ## 判定とレポート
 
 - confirmed: 出典のある設計契約との不一致、または範囲の明らかな違反観測を確認した。

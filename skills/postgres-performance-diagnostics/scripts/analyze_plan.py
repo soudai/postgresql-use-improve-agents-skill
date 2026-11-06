@@ -29,7 +29,6 @@ DETAIL_FIELDS = (
     "Filter", "Index Cond", "Hash Cond", "Merge Cond", "Join Filter", "Sort Key",
     "Group Key", "Output", "Function Call", "Recheck Cond",
 )
-PARAMETER = re.compile(r"\$[0-9]+")
 LIMITATIONS = [
     "Candidates are investigation leads, not proof of a missing index or an unsafe setting.",
     "Actual Rows and rows removed are per-loop averages; total output is approximate when rounded.",
@@ -37,6 +36,8 @@ LIMITATIONS = [
     "LIMIT, semi/anti joins and other early exits can prevent a node from running to completion.",
     "Parallel node averages and worker distributions require inspecting the original plan.",
     "A saved plan does not describe all parameter values, concurrency levels or cache conditions.",
+    "Parameter tokens alone cannot establish generic/custom plan mode; known mode requires capture provenance.",
+    "Lossy bitmap blocks are observations, not proof of work_mem exhaustion; BRIN is intrinsically lossy.",
     "Relation/index names remain visible. SQL expressions are omitted unless --include-details is used.",
     "Hotspot self time is Actual Total Time x loops minus children; parallel workers and CTE/SubPlan reuse make it approximate.",
 ]
@@ -81,11 +82,126 @@ def documents(value):
     return result
 
 
-def analyze(data, include_details=False):
+
+def parameter_tokens(expression):
+    """Lex $n tokens, ignoring SQL strings, quoted identifiers and comments."""
+    tokens, index = set(), 0
+    while index < len(expression):
+        char = expression[index]
+        if char in ("'", '"'):
+            quote = char
+            escaped = (quote == "'" and index > 0 and expression[index - 1] in "eE"
+                       and (index < 2 or not (expression[index - 2].isalnum() or expression[index - 2] == "_")))
+            index += 1
+            while index < len(expression):
+                if escaped and expression[index] == "\\":
+                    index += 2
+                elif expression[index] == quote:
+                    index += 1
+                    if index < len(expression) and expression[index] == quote:
+                        index += 1
+                    else:
+                        break
+                else:
+                    index += 1
+            continue
+        if expression.startswith("--", index):
+            end = expression.find("\n", index + 2)
+            index = len(expression) if end < 0 else end + 1
+            continue
+        if expression.startswith("/*", index):
+            depth, index = 1, index + 2
+            while index < len(expression) and depth:
+                if expression.startswith("/*", index):
+                    depth, index = depth + 1, index + 2
+                elif expression.startswith("*/", index):
+                    depth, index = depth - 1, index + 2
+                else:
+                    index += 1
+            continue
+        if char == "$" and (index == 0 or not (expression[index - 1].isalnum() or expression[index - 1] in "_$")):
+            delimiter = re.match(r"\$(?:[^\W\d]\w*)?\$", expression[index:])
+            if delimiter:
+                end = expression.find(delimiter[0], index + len(delimiter[0]))
+                index = len(expression) if end < 0 else end + len(delimiter[0])
+                continue
+            parameter = re.match(r"\$[0-9]+(?![\w$])", expression[index:])
+            if parameter:
+                tokens.add(parameter[0])
+                index += len(parameter[0])
+                continue
+        index += 1
+    return tokens
+
+
+def initplan_parameters(root):
+    """Older EXPLAIN versions name executor parameters in '(returns $n)'."""
+    parameters, stack = set(), [root]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        if node.get("Parent Relationship") == "InitPlan":
+            parameters.update(re.findall(r"\(returns (\$[0-9]+)\)", str(node.get("Subplan Name", ""))))
+        children = node.get("Plans", [])
+        if isinstance(children, list):
+            stack.extend(children)
+    return parameters
+
+
+def bitmap_access_methods(node, relation_evidence):
+    """Match inspect_relation.sql evidence only with exact schema/table/index identities."""
+    reports = relation_evidence if isinstance(relation_evidence, list) else [relation_evidence]
+    if relation_evidence is not None and not isinstance(relation_evidence, (dict, list)):
+        raise ValueError("Invalid relation evidence")
+    methods, names = {}, []
+    for report in reports:
+        if report is None:
+            continue
+        if not isinstance(report, dict):
+            raise ValueError("Invalid relation evidence")
+        relation = report.get("relation", {})
+        if not isinstance(relation, dict) or not isinstance(report.get("indexes", []), list):
+            raise ValueError("Invalid relation evidence")
+        if (not node.get("Schema") or not node.get("Relation Name")
+                or relation.get("schema") != node["Schema"] or relation.get("name") != node["Relation Name"]):
+            continue
+        for item in report.get("indexes", []):
+            if isinstance(item, dict) and isinstance(item.get("access_method"), str):
+                methods.setdefault(item.get("index_name"), set()).add(item["access_method"])
+    stack = list(node.get("Plans", []))
+    while stack:
+        child = stack.pop()
+        if not isinstance(child, dict):
+            continue
+        if child.get("Node Type") == "Bitmap Index Scan":
+            names.append(child.get("Index Name"))
+        elif child.get("Node Type") in ("BitmapAnd", "BitmapOr"):
+            stack.extend(child.get("Plans", []))
+    matched = [next(iter(methods[name])) for name in names if len(methods.get(name, set())) == 1]
+    return sorted(set(matched)), bool(names) and len(matched) == len(names)
+
+
+def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, relation_evidence=None):
+    capture = data.get("capture", {}) if isinstance(data, dict) else {}
+    if not isinstance(capture, dict):
+        raise ValueError("Invalid plan capture metadata")
+    mode = plan_mode or capture.get("plan_mode", "unknown")
+    source = plan_source if plan_source is not None else capture.get("source")
+    if mode not in ("unknown", "generic", "custom"):
+        raise ValueError("Invalid plan mode")
+    if source is not None and not isinstance(source, str):
+        raise ValueError("Invalid capture source")
+    if mode != "unknown" and (not isinstance(source, str) or not source.strip()):
+        raise ValueError("Known plan mode requires a capture source")
+    capture = {"plan_mode": mode, "source": source}
+
     report = {"schema_version": 1, "kind": "explain_analysis", "plans": [],
               "limitations": list(LIMITATIONS)}
     for plan_index, document in enumerate(documents(data)):
-        plan = {"index": plan_index, "nodes": [], "candidates": [], "uses_parameter_placeholders": False}
+        plan = {"index": plan_index, "nodes": [], "candidates": [], "uses_parameter_placeholders": False,
+                "plan_capture": capture}
+        internal_parameters = initplan_parameters(document["Plan"])
         for source, target in (("Planning Time", "planning_time_ms"), ("Execution Time", "execution_time_ms")):
             if number(document.get(source)):
                 plan[target] = document[source]
@@ -115,8 +231,15 @@ def analyze(data, include_details=False):
                                    ("Sort Method", "sort_method"), ("Sort Space Type", "sort_space_type")):
                 if isinstance(raw.get(source), str):
                     node[target] = raw[source]
-            # $n in a condition means a generic plan (prepared statement); only a flag is kept, never the text.
-            if any(isinstance(raw.get(key), str) and PARAMETER.search(raw[key]) for key in DETAIL_FIELDS if key != "Output"):
+            # Tokens are parameter evidence; capture context establishes generic/custom mode.
+            expressions = []
+            for key in DETAIL_FIELDS:
+                if key == "Output":
+                    continue
+                value = raw.get(key)
+                expressions.extend([value] if isinstance(value, str) else
+                                   [item for item in value if isinstance(item, str)] if isinstance(value, list) else [])
+            if any(parameter_tokens(expression) - internal_parameters for expression in expressions):
                 plan["uses_parameter_placeholders"] = True
             if include_details:
                 node["details"] = {key: raw[key] for key in DETAIL_FIELDS if key in raw}
@@ -148,11 +271,18 @@ def analyze(data, include_details=False):
                                                "next_step": "Check predicate selectivity and scan cost; a sequential scan may still be appropriate."})
                 recheck = raw.get("Rows Removed by Index Recheck")
                 if number(raw.get("Lossy Heap Blocks")) and raw["Lossy Heap Blocks"] > 0:
+                    methods, complete_methods = bitmap_access_methods(raw, relation_evidence)
+                    advice = ("BRIN is intrinsically lossy; inspect pages_per_range, physical correlation and recheck work. "
+                              if "brin" in methods else "Inspect index access methods, selectivity and recheck work. ")
                     plan["candidates"].append({"kind": "lossy_bitmap", "path": path,
                                                "evidence": {"lossy_heap_blocks": raw["Lossy Heap Blocks"],
                                                             "exact_heap_blocks": raw.get("Exact Heap Blocks"),
-                                                            "removed_by_recheck_per_loop": recheck},
-                                               "next_step": "The bitmap exceeded work_mem and rechecks whole pages; compare selectivity, a narrower index and work_mem for this query."})
+                                                            "removed_by_recheck_per_loop": recheck,
+                                                            "index_access_methods": methods,
+                                                            "access_methods_complete": complete_methods,
+                                                            "cause_status": "unconfirmed"},
+                                               "next_step": advice + "Lossy blocks alone do not prove memory pressure; "
+                                                            "test work_mem only as a measured hypothesis."})
                 if raw["Node Type"] == "Index Only Scan" and number(raw.get("Heap Fetches")) and raw["Heap Fetches"] >= 1000:
                     plan["candidates"].append({"kind": "index_only_heap_fetches", "path": path,
                                                "evidence": {"heap_fetches": raw["Heap Fetches"], "actual_rows_per_loop": actual, "loops": loops},
@@ -224,9 +354,11 @@ def analyze(data, include_details=False):
         ]
         plan["hotspots"] = hotspots(plan["nodes"], plan.get("execution_time_ms"))
         plan["candidates"] += join_candidates(plan["nodes"])
-        if plan["uses_parameter_placeholders"] and any(c["kind"] == "cardinality_mismatch" for c in plan["candidates"]):
-            plan["candidates"].append({"kind": "generic_plan_misestimate", "path": "Plan", "evidence": {},
-                                       "next_step": "A generic plan was misestimated; compare custom plans for representative parameter values before changing plan_cache_mode for that statement."})
+        if mode == "generic" and any(c["kind"] == "cardinality_mismatch" for c in plan["candidates"]):
+            plan["candidates"].append({"kind": "generic_plan_misestimate", "path": "Plan",
+                                       "evidence": {"plan_capture": capture},
+                                       "next_step": "A captured generic plan has a row-estimate mismatch; compare custom plans "
+                                                    "over representative parameters before attributing the mismatch to plan mode."})
         plan_ms, exec_ms = plan.get("planning_time_ms"), plan.get("execution_time_ms")
         if number(plan_ms) and number(exec_ms) and plan_ms >= 10 and plan_ms > exec_ms:
             plan["candidates"].append({"kind": "planning_dominates", "path": "Plan",
@@ -290,6 +422,7 @@ def markdown(report):
     for plan in report["plans"]:
         lines += [f"## Plan {plan['index'] + 1}", "",
                   f"Planning: {plan.get('planning_time_ms', 'not measured')} ms; execution: {plan.get('execution_time_ms', 'not measured')} ms.", "",
+                  "Plan capture: " + json.dumps(plan["plan_capture"], ensure_ascii=False), "",
                   "Root buffer counts (not a sum of all nodes): " + json.dumps(plan["root_buffers"], ensure_ascii=False), ""]
         if "jit" in plan:
             lines += ["JIT: " + json.dumps(plan["jit"], ensure_ascii=False), ""]
@@ -329,11 +462,21 @@ def main(argv=None):
     parser.add_argument("--output", type=Path)
     parser.add_argument("--format", choices=("json", "markdown"), default="markdown")
     parser.add_argument("--include-details", action="store_true", help="Include potentially sensitive SQL expressions")
+    parser.add_argument("--plan-mode", choices=("unknown", "generic", "custom"),
+                        help="Known mode from the capture session, never inferred from placeholder text")
+    parser.add_argument("--plan-source", help="Non-secret provenance locator; required for known plan mode")
+    parser.add_argument("--relation-evidence", type=Path,
+                        help="inspect_relation.sql JSON (one object or a list); use VERBOSE plans for schema matching")
     args = parser.parse_args(argv)
     try:
         with args.input.open(encoding="utf-8-sig") as handle:
             data = json.load(handle)
-        report = analyze(data, include_details=args.include_details)
+        relation_evidence = None
+        if args.relation_evidence:
+            with args.relation_evidence.open(encoding="utf-8-sig") as handle:
+                relation_evidence = json.load(handle)
+        report = analyze(data, include_details=args.include_details, plan_mode=args.plan_mode,
+                         plan_source=args.plan_source, relation_evidence=relation_evidence)
         output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n" if args.format == "json" else markdown(report)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

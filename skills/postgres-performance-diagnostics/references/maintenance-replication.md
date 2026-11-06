@@ -8,8 +8,10 @@
 
 `analyze.py`の`current`は次の2つで切り分けを助ける。
 
-- `autovacuum_backlog`: `n_dead_tup`、`n_ins_since_vacuum`、`n_mod_since_analyze`が、reloptionsを反映した起動閾値（PostgreSQL 18の`autovacuum_vacuum_max_threshold`を含む）を超えたテーブル。launcherは`autovacuum_naptime`ごとに巡回するため、比が1を少し超えるのは一時的に正常。大きく超えたまま残るなら、worker不足、cost制限（待機サンプルの`Timeout:VacuumDelay`）、ロックによる中断、回収不能のどれかを調べる。insert閾値は18以降の未freeze割合の補正を含まない近似。
+- `autovacuum_backlog`: `n_dead_tup`、`n_ins_since_vacuum`、`n_mod_since_analyze`が、reloptionsを反映した起動閾値（PostgreSQL 18の`autovacuum_vacuum_max_threshold`を含む）を超えたテーブル。launcherは`autovacuum_naptime`ごとに巡回するため、比が1を少し超えるのは一時的に正常。大きく超えたまま残るなら、worker不足、cost制限（待機サンプルの`Timeout:VacuumDelay`）、ロックによる中断、回収不能のどれかを調べる。insert閾値は`base + scale × max(reltuples, 0) × unfrozen_fraction`で求める。`relpages > 0`かつ`relallfrozen > 0`なら未freeze割合は`1 - min(relallfrozen, relpages) / relpages`、それ以外は1。カタログの推定値・採取時差・浮動小数点の丸めがあるため、境界付近は実行ログと再採取で確認する。式は[PostgreSQL 18の起動判定実装](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/postmaster/autovacuum.c#L2884-L2934)に対応する。
 - `xmin_horizon_holders`: このDBのセッションのxmin／xid、prepared transaction、replication slotのxmin・catalog_xmin、standbyのfeedbackをageの降順に並べる。最上位が回収を止めている候補。catalog_xminはシステムカタログだけに効く。他DBのセッションはこのDBのユーザーテーブルの回収を止めない。
+
+`current.autovacuum_unassessed`は、判定に必要な設定・統計がないテーブルと`unknown_triggers`／`missing_evidence`を示す。古いsnapshotで`relallfrozen`がない場合はinsert閾値を未確認にする。`reltuples`欠落を0とみなさず、実際のカタログ値が-1（まだVACUUMされていない）ならサーバと同じく0を使う。`track_counts`が無効・未取得の統計も判定不能にする。他の起動条件の超過を観測できた場合は`autovacuum_backlog`にも残し、欠測があることを理由に既知の問題を隠さない。insert閾値の-1は明示的な無効化であり、未取得とは区別する。ここでの候補は閾値に基づく保守の必要性で、workerの実行やwraparound保護を保証するものではない。
 
 パーティションの親テーブルはautovacuumがANALYZEしない。`partitioned_parent_never_analyzed`は、パーティション全体の推定に使う親の統計がない状態を示す。親に対する定期的な`ANALYZE`を検討する。
 

@@ -188,3 +188,24 @@ PostgreSQL 18.6（Debian 18.6-1.pgdg12+2、`pg_stat_statements` 1.12）と19 RC1
 - FKとAFTERトリガーの時間・回数、WAL、パーティション階層とgeneric planの実行時除外を取得できる。
 - 独立したpublisherとsubscriberで初期同期、適用、意図した無効化、制約競合、decoding spillを確認した。
 - 読み取りと更新の実pgbenchログを読み、結果一致と成功・未送信を含む集計を検証できる。
+
+
+## 診断の反例を使った回帰検証（2026-11-06）
+
+`tests/test_performance_evidence.py`の回帰ケースを先に追加し、旧実装の失敗を確認してから修正した。`tests/performance_evidence_scenarios.py`を隔離したPostgreSQL 18.6／19rc1の両方で実行し、次を確認した。19rc1の結果は当該RCのものであり、後続版の互換性を保証しない。
+
+| 反例 | 確認した出力 |
+| --- | --- |
+| 別ロールの実行中SQLが一般ユーザーから非表示 | AASはunknown、unknown session countが正。監視可能なロールではAASが1以上 |
+| 別バックエンドが`track_activities=off` | 採取側がonでも状態不明としてAASをunknownにする |
+| BRINで`work_mem=1GB`でもlossy blocksが発生 | access methodがbrinとして対応し、メモリ不足は未確認のまま |
+| 文字列`'$1'`とInitPlan | generic判定をせず、観測された行数推定誤差は残す |
+| `EXPLAIN EXECUTE`をgeneric／customに固定して採取 | 採取元を指定したgenericだけにgeneric候補を出す。出所を渡さない場合はモード不明 |
+| 10万行をfreeze後に2千行追加 | insert閾値が約1451になり超過を検出。未freeze割合を省いた旧式は21400で見落とした |
+
+採取SQLが`relallfrozen`を保持すること、欠落した旧snapshotではinsert判定を未確認にすることも確認した。ユニットテストでは引用符・ドル引用・コメント中の`$n`、schema違いの索引、既知の閾値超過と別条件の欠測の共存を検証する。
+
+```text
+python3 -m unittest discover -s tests -p test_performance_evidence.py
+python3 tests/performance_evidence_scenarios.py --images postgres:18-bookworm postgres:19rc1-bookworm
+```

@@ -49,19 +49,88 @@ def _pairs(item):
     return sorted(zip(local, remote))
 
 
+def _column_null_status(name, columns, constraints):
+    column = columns.get(name, {})
+    value = column.get("column_not_null")
+    if value is False:
+        return "absent"
+    if value is not True:
+        return "unknown"
+    # attnotnull is set for NOT VALID too. A domain NOT NULL is not a
+    # column guarantee: a typed NULL can bypass the domain conversion check.
+    proofs = [c for c in constraints if c.get("type") in ("n","p")
+              and name in c.get("columns", [])]
+    if any(c.get("validated") is True and c.get("enforced") is True for c in proofs):
+        return "validated"
+    if any(c.get("enforced") is False for c in proofs):
+        return "unenforced"
+    if any(c.get("validated") is False for c in proofs):
+        return "unvalidated"
+    return "unknown"
+
+
 def _null_blocked_by_match_full(name, columns, constraints):
-    # MATCH FULL rejects partial NULL; a NOT NULL member prevents the only
-    # otherwise allowed all-NULL case. Validation matters for preexisting rows.
+    # MATCH FULL rejects partial NULL. Only a validated column-level guarantee
+    # excludes all-NULL existing rows; domains and NOT VALID do not suffice.
     return any(
         c.get("type") == "f" and c.get("match_type") == "f" and
         c.get("validated") is True and c.get("enforced") is True and
         name in c.get("columns", []) and
-        any(columns.get(member, {}).get("not_null") is True for member in c.get("columns", []))
+        any(_column_null_status(member, columns, constraints) == "validated"
+            for member in c.get("columns", []))
         for c in constraints
     )
 
 
-def _fk_findings(snapshot, table, columns, constraints):
+def _required_null_findings(snapshot, table, columns, constraints, names, source,
+                            rule="null", context=(), inheritance_uncertain=False):
+    findings = []
+    for name in names:
+        column = columns.get(name)
+        state = _column_null_status(name, columns, constraints)
+        if state == "validated" or _null_blocked_by_match_full(name, columns, constraints):
+            if not inheritance_uncertain:
+                continue
+            state = "scope_unknown"
+        facts = list(context) + ["required column: " + name]
+        if source:
+            facts.append("contract: " + source)
+        facts.append("column NOT NULL guarantee: " + state)
+        if column and column.get("domain_not_null") is True:
+            facts.append("domain_not_null=true; domainの型変換時の検査は列のNULL禁止保証と異なる")
+        missing = [] if source else ["必須性を定めた業務上の契約の出典"]
+        observed = state not in ("unknown", "scope_unknown")
+        summary = "必須列のNULL禁止保証を確認できません。"
+        if state == "unvalidated":
+            summary = "必須列のNOT NULLが既存データに対して未検証です。"
+            facts.append("NOT NULL: 既存行は未検証 (validated=false)")
+        elif state == "unenforced":
+            summary = "必須列のNOT NULLが強制されていません。"
+            facts.append("NOT NULL: enforced=false")
+        elif state == "scope_unknown":
+            missing.append("通常継承子の有無・各子の列保証と、契約が親ONLYか継承子を含むか")
+            facts.append("親の局所制約だけでは、通常継承子を含むNULL禁止を保証しない")
+            if any(c.get("no_inherit") is True and name in c.get("columns", []) for c in constraints):
+                facts.append("NO INHERITの制約は子へ伝播しない")
+        elif state == "unknown":
+            missing.append("列NOT NULLの由来・validated/enforced状態。v1はv2で再収集する")
+        elif state == "absent":
+            facts.append("column_not_null=false")
+        status = _verdict(source, observed)
+        if state == "absent" and (column.get("domain_has_check") is True or
+                not _complete(snapshot,"constraints") or any(c.get("type") == "c" for c in constraints)):
+            status = "candidate" if source else "needs_evidence"
+            missing.append("CHECK等が必須性を保証しているか（式は通常収集の対象外）")
+        findings.append(_finding(rule, table["relation"], status, summary, facts, missing,
+            recommendation=("domainと列制約を分け、既存NULLの修復・列NOT NULLの追加/検証を計画する。",
+                            "新規書込みへの強制と、既存行の検証をそれぞれ確認する。"),
+            verification=("空のスカラー副問い合わせ由来のNULL、新規INSERT/UPDATE、既存行を検証する。",
+                          "MATCH FULLの全列NULLを禁止するには検証済みの列NOT NULL等の根拠が必要。"),
+            group=table["relation"] + ":lifecycle"))
+    return findings
+
+
+def _fk_findings(snapshot, table, columns, constraints, inheritance_uncertain=False):
     relation = table["relation"]
     findings = []
     for expected in table.get("relationships", []):
@@ -71,6 +140,11 @@ def _fk_findings(snapshot, table, columns, constraints):
         facts = [f"declared reference: {names} -> {target} {expected.get('referenced_columns', [])}"]
         if source:
             facts.append("contract: " + source)
+        if expected.get("allow_null") is False:
+            findings.extend(_required_null_findings(
+                snapshot, table, columns, constraints, names, source,
+                rule="null" if expected.get("enforce") is False else "fk", context=facts,
+                inheritance_uncertain=inheritance_uncertain))
         if expected.get("enforce") is False:
             findings.append(_finding("fk", relation, "exception" if source else "needs_evidence",
                 "参照整合性をFKで保証しない設計として申告されています。",
@@ -124,27 +198,6 @@ def _fk_findings(snapshot, table, columns, constraints):
                     unknown, severity="high" if actual.get("enforced") is False else "medium",
                     recommendation=("既存FKの検証状態・MATCH・更新/削除動作を確認し、必要な差分だけ計画する。",),
                     verification=("既存データと新規書込みを分けて確認し、期待する削除・更新・NULLの動作を検証する。",)))
-        if expected.get("allow_null") is False:
-            for name in names:
-                col = columns.get(name)
-                if (col and col.get("not_null") is True) or _null_blocked_by_match_full(name, columns, constraints):
-                    continue
-                missing = [] if source else ["NULLを許可しない設計意図の出典"]
-                observed = col is not None and col.get("not_null") is False
-                if not observed:
-                    missing.append(f"{name}の実効NOT NULL情報")
-                status = _verdict(source, observed)
-                if observed and (col.get("domain_has_check") is True or
-                                 not _complete(snapshot, "constraints") or
-                                 any(c.get("type") == "c" for c in constraints)):
-                    status = "candidate" if source else "needs_evidence"
-                    missing.append("CHECK等による同等のNULL禁止保証")
-                findings.append(_finding("fk", relation, status,
-                    "必須の参照列でNULL禁止が確認できません。",
-                    facts + [f"column: {name}; not_null={col.get('not_null') if col else 'unknown'}"],
-                    missing,
-                    recommendation=("未発生・非該当を許す業務か確認し、必須ならNOT NULL相当の保証を計画する。",),
-                    verification=("MATCH FULLでも全列NULLは許されるため、必須性を別に検証する。",)))
     return findings
 
 
@@ -193,7 +246,7 @@ def _name_findings(snapshot, table, actual, columns, vocabulary):
     return findings
 
 
-def _profile_findings(table, evidence, columns, constraints):
+def _profile_findings(table, evidence, columns, constraints, inheritance_uncertain=False):
     relation, findings = table["relation"], []
     required = set(table.get("required_columns", []))
     for expected in table.get("relationships", []):
@@ -224,9 +277,16 @@ def _profile_findings(table, evidence, columns, constraints):
                                                if names & set(r.get("columns", []))}))
             if not names or not names.issubset(required):
                 missing.append("対象列を必須とする業務上の契約")
-            if any(columns.get(name, {}).get("not_null") is True or
-                   _null_blocked_by_match_full(name, columns, constraints) for name in names):
-                missing.append("現在のNULL禁止保証とNULL違反集計の時点・対象の整合")
+            # A multi-column violation can be NULL in any required member.
+            # One protected member does not contradict NULL in another member.
+            if names and all(_column_null_status(name, columns, constraints) == "validated" or
+                             _null_blocked_by_match_full(name, columns, constraints) for name in names):
+                if not inheritance_uncertain:
+                    missing.append("現在のNULL禁止保証とNULL違反集計の時点・対象の整合")
+                elif profile.get("includes_children") is False:
+                    missing.append("ONLYで集計したNULL違反と親の局所NULL禁止保証の時点・対象の整合")
+                elif profile.get("includes_children") is not True:
+                    missing.append("集計が親ONLYか通常継承子を含むか（includes_children）の確認")
             rule, summary = "null", "必須性に反するNULLの集計が報告されています。"
             recommendation = "NULLの意味を確認し、補完・ライフサイクル分割・必須制約の適用を比較する。"
         else:
@@ -249,6 +309,8 @@ def _profile_findings(table, evidence, columns, constraints):
         facts = [f"columns: {sorted(names)}; violations={profile.get('violations')}; "
                  f"rows_checked={profile.get('rows_checked')}; complete={profile.get('complete')}",
                  "scope: " + str(profile.get("scope", "(unknown)"))]
+        if "includes_children" in profile:
+            facts.append("includes_children: " + str(profile["includes_children"]))
         if source:
             facts.append("contract: " + source)
         if profile.get("source"):
@@ -263,42 +325,11 @@ def _profile_findings(table, evidence, columns, constraints):
     return findings
 
 
-def _null_findings(snapshot, table, columns):
-    relation, findings = table["relation"], []
-    source = table.get("source")
-    constraints = [c for c in _rows(snapshot, "constraints") if c.get("relation") == relation]
-    for name in table.get("required_columns", []):
-        col = columns.get(name)
-        if (col and col.get("not_null") is True) or _null_blocked_by_match_full(name, columns, constraints):
-            continue
-        facts = [f"required column: {name}"]
-        if source:
-            facts.append("contract: " + source)
-        missing = [] if source else ["必須性を定めた業務上の契約の出典"]
-        if col is None:
-            missing.append("対象列の定義（スキーマと契約の対象・時点を照合）")
-        elif col.get("not_null") is not False:
-            missing.append("実効NOT NULL情報")
-        else:
-            facts.append("not_null=false")
-        # Expressions are intentionally not collected; a CHECK or trigger can supply
-        # equivalent protection. Missing NOT NULL is a structural candidate, not proof
-        # that invalid data is currently accepted by every write path.
-        equivalent = [c for c in _rows(snapshot, "constraints")
-                      if c.get("relation") == relation and c.get("type") == "c"]
-        observed = col is not None and col.get("not_null") is False
-        status = _verdict(source, observed)
-        if observed and (col.get("domain_has_check") is True or
-                         equivalent or not _complete(snapshot, "constraints")):
-            status = "candidate" if source else "needs_evidence"
-            missing.append("CHECK等が必須性を保証しているか（式は通常収集の対象外）")
-        findings.append(_finding("null", relation, status,
-            "必須列のNOT NULLが確認できません。",
-            facts, missing,
-            recommendation=("NULLの業務上の意味、既存のCHECK・ドメイン・書込経路を確認し、必須性を保証する方法を決める。",),
-            verification=("統計上NULLがないことと将来の必須性を区別し、新規・更新の両経路を検証する。",),
-            group=relation + ":lifecycle"))
-    return findings
+def _null_findings(snapshot, table, columns, inheritance_uncertain=False):
+    constraints = [c for c in _rows(snapshot,"constraints") if c.get("relation") == table["relation"]]
+    return _required_null_findings(snapshot, table, columns, constraints,
+                                   table.get("required_columns", []), table.get("source"),
+                                   inheritance_uncertain=inheritance_uncertain)
 
 
 def _flag_findings(table, columns):
@@ -350,11 +381,20 @@ def review(snapshot: dict, contract: dict, evidence: dict) -> list[dict]:
         if actual is None:
             # The report layer emits schema.coverage for unmatched contracts.
             continue
-        columns = {r["name"]: r for r in all_columns if r.get("relation") == relation}
+        columns = {r["name"]: dict(r) for r in all_columns if r.get("relation") == relation}
+        if snapshot.get("schema_version") != 2:
+            # v1 conflated column and domain NOT NULL and omitted validation.
+            # false establishes absence; true must never become a guarantee.
+            for column in columns.values():
+                column["column_not_null"] = False if column.get("not_null") is False else None
+                column["domain_not_null"] = None
         constraints = [r for r in all_constraints if r.get("relation") == relation]
-        findings.extend(_fk_findings(snapshot, table, columns, constraints))
+        # Parent-local NOT NULL/PK/FK metadata does not establish descendant
+        # guarantees for ordinary inheritance. Missing scope metadata stays unknown.
+        inheritance_uncertain = actual.get("has_inheritance_children") is not False
+        findings.extend(_fk_findings(snapshot, table, columns, constraints, inheritance_uncertain))
         findings.extend(_name_findings(snapshot, table, actual, columns, contract.get("vocabulary", {})))
-        findings.extend(_null_findings(snapshot, table, columns))
+        findings.extend(_null_findings(snapshot, table, columns, inheritance_uncertain))
         findings.extend(_flag_findings(table, columns))
-        findings.extend(_profile_findings(table, evidence, columns, constraints))
+        findings.extend(_profile_findings(table, evidence, columns, constraints, inheritance_uncertain))
     return findings
