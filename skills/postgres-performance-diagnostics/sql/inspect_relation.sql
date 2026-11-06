@@ -4,6 +4,10 @@
 -- :'relation' is a psql-quoted SQL literal; never change it to raw :relation interpolation.
 -- This query omits data values, SQL expressions, predicates, defaults, and histogram bounds.
 \set ON_ERROR_STOP on
+\if :{?include_partition_bounds}
+\else
+\set include_partition_bounds false
+\endif
 BEGIN READ ONLY;
 SET LOCAL search_path = pg_catalog;
 SET LOCAL statement_timeout = '10s';
@@ -15,6 +19,29 @@ WITH target AS MATERIALIZED (
     FROM pg_catalog.pg_class AS c
     JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
     WHERE c.oid = :'relation'::pg_catalog.regclass
+), partition_members AS MATERIALIZED (
+    SELECT tree.relid, tree.parentrelid, tree.isleaf, tree.level
+    FROM target AS t
+    CROSS JOIN LATERAL pg_catalog.pg_partition_tree(pg_catalog.pg_partition_root(t.oid)) AS tree
+    LIMIT 501
+), partition_details AS (
+    SELECT m.relid, m.parentrelid, m.isleaf, m.level, n.nspname AS schema_name, c.relname,
+           c.reltuples AS estimated_rows, pg_catalog.pg_relation_size(c.oid) AS heap_bytes,
+           st.last_analyze, st.last_autoanalyze, st.n_mod_since_analyze,
+           p.partstrat AS partition_strategy, p.partattrs::text AS partition_key_attributes,
+           p.partexprs IS NOT NULL AS expression_key,
+           CASE WHEN :'include_partition_bounds'::boolean
+                THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid) END AS bound,
+           CASE WHEN :'include_partition_bounds'::boolean AND p.partrelid IS NOT NULL
+                THEN pg_catalog.pg_get_partkeydef(c.oid) END AS partition_key,
+           (SELECT count(*) FROM pg_catalog.pg_index AS i WHERE i.indrelid = c.oid) AS indexes,
+           (SELECT count(*) FROM pg_catalog.pg_index AS i WHERE i.indrelid = c.oid
+                 AND NOT (i.indisvalid AND i.indisready)) AS invalid_or_unready_indexes
+    FROM (SELECT * FROM partition_members LIMIT 500) AS m
+    JOIN pg_catalog.pg_class AS c ON c.oid = m.relid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+    LEFT JOIN pg_catalog.pg_partitioned_table AS p ON p.partrelid = c.oid
+    LEFT JOIN pg_catalog.pg_stat_all_tables AS st ON st.relid = c.oid
 ), columns AS (
     SELECT a.attnum, a.attname,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
@@ -110,6 +137,11 @@ SELECT jsonb_build_object(
         'any_column_select_permitted', has_any_column_privilege(t.oid, 'SELECT'),
         'table_owner_role_available', pg_has_role(t.relowner, 'USAGE'),
         'note', 'Empty statistics can mean not analyzed, disabled statistics, privilege/RLS filtering, or an inapplicable statistical kind; they do not prove that no statistics exist.'),
+    'partition_tree', jsonb_build_object(
+        'truncated', (SELECT count(*) > 500 FROM partition_members),
+        'bounds_included', :'include_partition_bounds'::boolean,
+        'members', COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.level, p.relid)
+                            FROM partition_details AS p), '[]'::jsonb)),
     'columns', COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.attnum)
                          FROM columns AS c), '[]'::jsonb),
     'indexes', COALESCE((SELECT jsonb_agg(to_jsonb(i) ORDER BY i.indexrelid)

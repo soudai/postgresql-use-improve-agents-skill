@@ -68,3 +68,9 @@ standbyではクエリ競合、replay、読み取り負荷、feedbackのprimary�
 - [Standbyとreplication slots](https://www.postgresql.org/docs/18/warm-standby.html)
 - [累積統計](https://www.postgresql.org/docs/18/monitoring-stats.html)
 - [PostgreSQL 18の変更点](https://www.postgresql.org/docs/18/release-18.html)
+
+## 論理レプリケーションの適用停止
+
+`current.subscriptions`でenabledとworkerを照合し、`subscription_relations`の状態から初期コピー中と同期済みを見分ける。enabledでもworkerが見えない場合は、欠測・権限不足を除き、subscriberログと`deltas.subscription_stats`のapply/sync error・競合を確認する。再試行中に一度だけ見たPIDで継続稼働を判断しない。無効化されている場合も、意図した停止か`disable_on_error`かを変更履歴とログで確認する。
+
+publisherとsubscriberの採取時刻を揃え、slot名、受信・適用の進捗、保持WAL、`replication_slots`のspillとstreamの増分を照合する。subscriberの適用停止とpublisherのデコード負荷は別に対処する。メモリ調整時は並行slotの予算を見積もり、競合の修正や再同期では欠落・二重適用の有無と結果一致を確認する。レポートの時刻は各ビューの収集時刻で、列欠落・権限不足・resetは警告と元snapshotで確認する。[論理レプリケーション監視](https://www.postgresql.org/docs/18/logical-replication-monitoring.html)

@@ -12,6 +12,7 @@ import sys
 
 
 METRICS = (
+    "Subplans Removed", "WAL Records", "WAL FPI", "WAL Bytes",
     "Startup Cost", "Total Cost", "Plan Rows", "Plan Width", "Actual Startup Time",
     "Actual Total Time", "Actual Rows", "Actual Loops", "Rows Removed by Filter",
     "Rows Removed by Join Filter", "Rows Removed by Index Recheck", "Heap Fetches",
@@ -90,6 +91,19 @@ def analyze(data, include_details=False):
                 plan[target] = document[source]
         if isinstance(document.get("JIT"), dict):
             plan["jit"] = numeric_tree(document["JIT"])
+        triggers = document.get("Triggers")
+        if isinstance(triggers, list):
+            plan["triggers"] = [
+                {key: trigger[key] for key in ("Trigger Name", "Relation", "Constraint Name", "Calls", "Time")
+                 if key in trigger and (number(trigger[key]) if key in ("Calls", "Time")
+                                        else isinstance(trigger[key], str))}
+                for trigger in triggers if isinstance(trigger, dict)
+            ]
+            timed = [trigger for trigger in plan["triggers"] if trigger.get("Time", 0) > 0]
+            slowest = max(timed, key=lambda trigger: trigger["Time"], default={})
+            if slowest.get("Time", 0) >= max(10, plan.get("execution_time_ms", 0) * 0.1):
+                plan["candidates"].append({"kind": "dml_trigger_time", "path": "Triggers", "evidence": slowest,
+                    "next_step": "Check trigger timing, foreign key indexes and nested statements. Trigger time can overlap node time."})
         stack = [(document["Plan"], "Plan", False)]
         while stack:
             raw, path, below_limit = stack.pop()
@@ -197,6 +211,17 @@ def analyze(data, include_details=False):
             for child_index in reversed(range(len(children))):
                 stack.append((children[child_index], f"{path}/Plans/{child_index}", below_limit or raw["Node Type"] == "Limit"))
         plan["root_buffers"] = {key: value for key, value in plan["nodes"][0]["metrics"].items() if "Blocks" in key}
+        children_by_path = {}
+        for child in plan["nodes"][1:]:
+            children_by_path.setdefault(child["path"].rsplit("/Plans/", 1)[0], []).append(child)
+        plan["partition_evidence"] = [
+            {"path": node["path"], "subplans_removed": node["metrics"].get("Subplans Removed"),
+             "children": [{"path": child["path"], "relation": child.get("relation"),
+                           "actual_loops": child["metrics"].get("Actual Loops")}
+                          for child in children_by_path.get(node["path"], [])]}
+            for node in plan["nodes"]
+            if node["node_type"] in ("Append", "Merge Append")
+        ]
         plan["hotspots"] = hotspots(plan["nodes"], plan.get("execution_time_ms"))
         plan["candidates"] += join_candidates(plan["nodes"])
         if plan["uses_parameter_placeholders"] and any(c["kind"] == "cardinality_mismatch" for c in plan["candidates"]):
@@ -268,6 +293,12 @@ def markdown(report):
                   "Root buffer counts (not a sum of all nodes): " + json.dumps(plan["root_buffers"], ensure_ascii=False), ""]
         if "jit" in plan:
             lines += ["JIT: " + json.dumps(plan["jit"], ensure_ascii=False), ""]
+        if plan.get("triggers"):
+            lines += ["### Trigger evidence", "", "Trigger times can overlap plan node times.", "",
+                      json.dumps(plan["triggers"], ensure_ascii=False), ""]
+        if plan.get("partition_evidence"):
+            lines += ["### Append and pruning evidence", "",
+                      json.dumps(plan["partition_evidence"], ensure_ascii=False), ""]
         if plan["hotspots"]:
             lines += ["### Self-time hotspots (approximate)", ""]
             for spot in plan["hotspots"]:

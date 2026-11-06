@@ -117,7 +117,7 @@ def preflight(client: Psql) -> dict:
     return client.run("""
 SELECT jsonb_build_object(
   'server_version_num', current_setting('server_version_num')::integer,
-  'server_version', version(), 'database', current_database(),
+  'server_version', version(), 'database', current_database(), 'session_role', session_user, 'effective_role', current_user,
   'database_oid', (SELECT oid FROM pg_database WHERE datname = current_database()),
   'postmaster_start', pg_postmaster_start_time(), 'in_recovery', pg_is_in_recovery(),
   'block_size', current_setting('block_size')::integer,

@@ -42,6 +42,31 @@ class CompareTests(unittest.TestCase):
         self.assertIn("verify result correctness", warnings)
         self.assertEqual(result["settings_changed"], {"work_mem": ["4096", "65536"]})
 
+    def test_same_query_for_two_roles_is_order_independent(self):
+        slow = report(1, 100, 1, 1, 0)
+        fast = report(1, 1, 1, 1, 0)
+        entries = []
+        for userid, source in ((10, slow), (20, fast)):
+            row = source["deltas"]["pgss"][0]
+            row["identity"].update(dbid=5, userid=userid, toplevel=True)
+            entries.append(row)
+        before = dict(slow, deltas={"pgss": entries})
+        after = dict(slow, deltas={"pgss": list(reversed(entries))})
+        compared = COMPARE.compare(before, after)
+        self.assertEqual([r["after_over_before"]["total_exec_time_per_call"] for r in compared["statements"]], [1, 1])
+        self.assertEqual({r["baseline_identity"] for r in compared["statements"]}, {"5:10:42", "5:20:42"})
+        ambiguous = COMPARE.compare(before, after, queryids=["42"])
+        self.assertFalse(ambiguous["statements"])
+        self.assertTrue(any("ambiguous" in w for w in ambiguous["warnings"]))
+
+    def test_cross_major_requires_mapping(self):
+        before = report(1, 100, 1, 1, 0)
+        after = report(1, 10, 1, 1, 0)
+        before["metadata"] = {"server_version_num": 180006}
+        after["metadata"] = {"server_version_num": 190000}
+        self.assertEqual(COMPARE.compare(before, after)["statements"], [])
+        self.assertEqual(len(COMPARE.compare(before, after, {"42": "42"})["statements"]), 1)
+
     def test_rewritten_sql_needs_explicit_mapping(self):
         after = report(10, 10, 2000, 1, 0)
         after["deltas"]["pgss"][0]["identity"]["queryid"] = 77

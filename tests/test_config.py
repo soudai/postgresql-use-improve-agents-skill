@@ -99,8 +99,24 @@ class ConfigTests(unittest.TestCase):
         data = settings(work_mem=str(512 * 1024), max_connections="500")
         _, found = run(data, ram_gb=16)
         self.assertEqual(found["work_mem"]["severity"], "high")
-        _, found = run(data, ram_gb=16, max_active_connections=4)
+        _, found = run(data, ram_gb=16, max_active_connections=4, parallel_workers_per_query=0)
         self.assertNotIn("work_mem", found)
+
+    def test_zero_budget_has_no_numeric_recommendation(self):
+        result, found = run(settings(shared_buffers=str(int(3.5 * 1024 ** 3 // 8192))),
+                            ram_gb=16, memory_limit_gb=4, max_active_connections=100,
+                            plan_shape_known=True)
+        self.assertEqual(result["memory_budget"]["query_budget_bytes"], 0)
+        self.assertIsNone(found["work_mem"]["recommended"])
+
+    def test_evidence_target_mismatch_is_excluded(self):
+        report = interval(4, 8)
+        report.update(instance_id="other", database="postgres")
+        result = MODULE.review(MODULE.load_settings(settings()), options(), report,
+                               provenance={"instance_id": "local", "database": "postgres"})
+        self.assertEqual(result["evidence"], {})
+        self.assertTrue(any("instance_id" in warning for warning in result["warnings"]))
+        self.assertFalse(any(f["parameter"] == "max_wal_size" for f in result["findings"]))
 
     def test_temp_spill_suggests_scoped_work_mem(self):
         _, found = run(settings(), interval(12, 0, temp=1024 ** 2), ram_gb=64, max_active_connections=20)

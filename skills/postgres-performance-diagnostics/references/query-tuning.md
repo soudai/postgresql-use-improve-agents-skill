@@ -143,3 +143,9 @@ prepared statementではgeneric／custom plan、パラメータ分布、型を�
 - [ORDER BYと索引](https://www.postgresql.org/docs/18/indexes-ordering.html)
 - [プランナー統計](https://www.postgresql.org/docs/18/planner-stats.html)
 - [PREPARE](https://www.postgresql.org/docs/18/sql-prepare.html)
+
+## DMLとパーティション
+
+UPDATEやDELETEで検索ノードより文全体が遅ければ、取得済みのEXPLAIN JSONを`analyze_plan.py`に渡し`triggers`を確認する。AFTERトリガーの時間はノードの時間から見えず、BEFOREの時間はノードと重なり得る。遅延制約はコミット時も測る。トリガー時間をノード時間へ一律に加算せず、呼出回数と時間を個別に見る。FKの参照元を`inspect_relation.sql`の制約メタデータからたどり、参照元列に使える索引とnested statementの計画を照合する。対策前後で参照整合性、更新結果、WAL、ロック時間を確認する。DMLのANALYZE実行は副作用を確認した隔離環境で行う。[EXPLAINの公式資料](https://www.postgresql.org/docs/18/using-explain.html)
+
+パーティションの調査では親に対して`inspect_relation.sql`を実行する。`partition_tree`は最大500件の階層、サイズ、統計、索引状態を返す。境界・キー式が必要な場合は開示範囲を確認して`--set=include_partition_bounds=true`を渡す。計画生成時の除外は階層と対象子の差、初期化時の除外は`Subplans Removed`、実行中の除外は子のloopsとパラメータの変化から確認する。loopsが0になる理由には上位ノードでの打ち切りもある。代表値ごとの計画時間、読み取り量、実行時間、結果を比較し、型・式、統計、索引、分割粒度のどこを変えるか決める。[パーティションの公式資料](https://www.postgresql.org/docs/18/ddl-partitioning.html#DDL-PARTITION-PRUNING)

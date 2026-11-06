@@ -62,3 +62,5 @@ description: Diagnose PostgreSQL 18 and 19 performance using wait-event sampling
 ## 成果物
 
 最初に利用者への影響と優先候補を示し、各候補に対象、期間、数値の根拠、仮説と確信度、不足情報、改善案、変更コスト、検証・切り戻しを添える。付属解析の候補をそのまま確定原因にしない。[validation.md](references/validation.md)の形式を使い、同じ現象の重複提案をまとめる。
+
+代表負荷の設計・再生と、変更の採用判定には`postgres-workload-validation`を使う。

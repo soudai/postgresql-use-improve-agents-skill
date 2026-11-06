@@ -47,6 +47,9 @@ SPECS = {
     "archiver": ((), ("archived_count", "failed_count")),
     "conflicts": (("datid",), ("confl_tablespace", "confl_lock", "confl_snapshot",
         "confl_bufferpin", "confl_deadlock", "confl_active_logicalslot")),
+    "subscription_stats": (("subid",), ("apply_error_count", "sync_error_count", "confl_insert_exists",
+        "confl_update_origin_differs", "confl_update_exists", "confl_update_missing",
+        "confl_delete_origin_differs", "confl_delete_missing", "confl_multiple_unique_conflicts")),
     "replication_slots": (("slot_name",), ("spill_txns", "spill_count", "spill_bytes",
         "stream_txns", "stream_count", "stream_bytes", "total_txns", "total_bytes")),
 }
@@ -113,6 +116,10 @@ def validate_pair(before, after):
     for key in ("database_oid", "database", "server_version_num", "postmaster_start", "in_recovery", "block_size"):
         if before["metadata"].get(key) is None or before["metadata"][key] != after["metadata"].get(key):
             raise ValueError(f"incompatible snapshots: {key} changed or missing")
+    for key in ("session_role", "effective_role"):
+        left, right = before["metadata"].get(key), after["metadata"].get(key)
+        if left is not None and right is not None and left != right:
+            raise ValueError(f"incompatible snapshots: {key} changed")
     if "server_identity_changed_during_collection" in before.get("warnings", []) + after.get("warnings", []):
         raise ValueError("server identity changed inside a snapshot")
     if timestamp(after["started_at"]) <= timestamp(before["finished_at"]):
@@ -149,6 +156,10 @@ def section_deltas(before, after, name, warnings):
                 or changed_marker(db_a[0], db_b[0], "stats_reset")):
             warnings.append(f"{name}: database reset marker changed or unavailable; interval suppressed")
             return []
+    if name in ("subscription_stats", "replication_slots") and any(
+            "stats_reset" not in row for section in (a, b) for row in section["rows"]):
+        warnings.append(f"{name}: reset marker unavailable; interval suppressed")
+        return []
     if name == "pgss":
         ext = lambda snap: next((e.get("version") for e in snap["metadata"].get("extensions", [])
                                 if e.get("name") == "pg_stat_statements"), None)
@@ -470,6 +481,9 @@ def analyze(before, after, top=10):
                   "retained_wal_bytes", "in_recovery"),
         "replication": ("pid", "state", "sync_state", "sent_lsn", "write_lsn", "flush_lsn", "replay_lsn",
                         "write_lag", "flush_lag", "replay_lag", "backend_xmin_age"),
+        "subscriptions": ("subid", "subname", "enabled", "slot_name", "worker_type", "pid", "leader_pid",
+                          "relid", "received_lsn", "latest_end_lsn", "latest_end_time", "last_msg_receipt_time"),
+        "subscription_relations": ("subid", "relid", "schema_name", "relation_name", "sync_state", "sync_lsn"),
         "prepared": ("transaction", "transaction_age", "gid", "prepared", "database"),
     }
     for name, fields in gauge_keys.items():
@@ -491,7 +505,14 @@ def analyze(before, after, top=10):
     current["xmin_horizon_holders"] = xmin_horizon_holders(after)[:top]
     current["redundant_indexes"] = redundant_indexes(rows(after, "indexes"))[:top]
     current["autovacuum_backlog"] = autovacuum_backlog(rows(after, "tables"), settings(after))[:top]
-    return {"schema_version": 1, "instance_id": after["instance_id"], "database": after["metadata"]["database"],
+    metadata = {key: after["metadata"].get(key) for key in
+                ("database", "database_oid", "server_version_num", "postmaster_start", "in_recovery",
+                 "session_role", "effective_role", "extensions")}
+    current["subscription_observed_at"] = {
+        name: after["sections"].get(name, {}).get("collected_at")
+        for name in ("subscriptions", "subscription_relations", "slots")
+    }
+    return {"schema_version": 1, "metadata": metadata, "instance_id": after["instance_id"], "database": after["metadata"]["database"],
             "window": {"from": before["started_at"], "to": after["finished_at"],
                        "note": "Overall collection bounds; use each section's elapsed_seconds for interval rates."},
             "rankings": rankings, "deltas": deltas, "current": current,
