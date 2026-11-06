@@ -113,6 +113,15 @@ eager loading、JOIN、バッチ取得は結果の多重化・順序・整合性
 
 prepared statementではgeneric／custom plan、パラメータ分布、型を確認する。`plan_cache_mode`の全体変更で特定例だけを直さない。同じセッションで`PREPARE`し、`plan_cache_mode`を`force_generic_plan`／`force_custom_plan`に切り替えて、代表値ごとの`EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE`を比べる。値の出現頻度で重み付けした合計で判断する。PostgreSQL 19の`pg_stat_statements`（19rc1で確認、18にはない）は`generic_plan_calls`・`custom_plan_calls`で、実際にどちらが使われたかを示す。18では`auto_explain`の計画や、同じセッションでの`EXPLAIN EXECUTE`で確認する。DDL、設定、デプロイ、統計更新の前後で、同じqueryidでも計画が変わることを考慮する。
 
+| 確認した差 | 変更候補 |
+| --- | --- |
+| `n_mod_since_analyze`が増え、分布が変わった後に推定がずれた | `ANALYZE`。再発頻度と保守負荷からテーブル単位のANALYZE閾値を評価 |
+| 単一列の頻出値が十分に表現されない | 対象列の統計ターゲットを調整し、採取・計画コストも測る |
+| 同一表の複数条件で列間の依存・値の組み合わせを見落とす | `CREATE STATISTICS`と`ANALYZE`で依存関係やMCVを検証 |
+| genericで一部値が全件走査、customで部分索引を使う | 部分索引の述語をSQLが含意するか、パラメータ型とpartition pruningを確認。SQLの分割、索引設計、対象セッションのcustom planを比較 |
+
+同じ頻度分布と同時実行数で再生し、値ごとの結果、計画、バッファアクセス、実行・計画時間と全体のthroughputを比較する。`force_*_plan`は検証セッションで使い、実環境の`auto`で選ばれる計画も別に確認する。`tests/scenarios.py --only 9`は部分索引を使える稀な値と全件走査が妥当な頻出値を混ぜ、6クライアントで再現する。
+
 計画時間、JIT時間、parallel worker不足、関数・トリガー内部の負荷も候補になる。計画時間計測が無効な場合の0を「planning負荷なし」としない。関数内SQLは必要に応じて追跡設定やauto_explainのnested statement採取を検討する。
 
 ## 検証例

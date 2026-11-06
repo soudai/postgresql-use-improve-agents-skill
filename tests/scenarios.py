@@ -10,6 +10,7 @@ Example: python tests/scenarios.py --image postgres:18-bookworm --report scenari
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
 import json
@@ -327,10 +328,9 @@ VACUUM ANALYZE;
                    all(d["identity"].get("relname") != "orders" for d in reset["deltas"]["tables"]),
                    [w for w in reset["warnings"] if w.startswith("tables")])
         self.check("limitations state OS metrics are needed for physical I/O",
-                   any("physical disk read" in x for x in cold["limitations"]))
+                   any("OS/storage metrics" in x for x in cold["limitations"]))
         self.measure(range_hit_cold=comparison["before"]["shared_hit_ratio"], range_hit_warm=comparison["after"]["shared_hit_ratio"],
-                     batch_read_time_share=b and b["read_time_share"],
-                     note="tmpfs storage: real I/O latency cannot be reproduced; read_time_share is the discriminating metric")
+                     batch_read_time_share=b and b["read_time_share"])
 
     # ------------------------------------------------------------------------------------------
     def issue5(self):
@@ -613,29 +613,64 @@ VACUUM ANALYZE;
         self.check("stale statistics: mismatch and analyze backlog, fixed by ANALYZE",
                    "cardinality_mismatch" in kinds(stale) and backlog.get("s9_events", {}).get("analyze_ratio", 0) > 1
                    and "cardinality_mismatch" not in kinds(fresh), backlog.get("s9_events"))
-        # A job queue: 99% done, four rare states that the application polls far more often than 'done'.
+        # A partial queue index covers states polled by workers. A generic plan cannot
+        # prove that an unknown parameter satisfies the index predicate.
         self.c.psql("CREATE TABLE s9_jobs AS SELECT i AS id, CASE i % 400 WHEN 0 THEN 'pending' WHEN 1 THEN 'running' "
                     "WHEN 2 THEN 'failed' WHEN 3 THEN 'queued' ELSE 'done' END AS status, md5(i::text) AS payload "
-                    "FROM generate_series(1, 300000) i; CREATE INDEX s9_jobs_status ON s9_jobs (status); ANALYZE s9_jobs;")
+                    "FROM generate_series(1, 300000) i; CREATE INDEX s9_jobs_status ON s9_jobs (status) "
+                    "WHERE status IN ('pending', 'running', 'failed', 'queued'); ANALYZE s9_jobs;")
         values = {"done": 0.1, "pending": 0.3, "running": 0.2, "failed": 0.1, "queued": 0.3}
         script = [serial, "PREPARE s9q(text) AS SELECT count(*), max(payload) FROM s9_jobs WHERE status = $1;"]
         for mode in ("force_generic_plan", "force_custom_plan"):
             script.append(f"SET plan_cache_mode = {mode};")
             script += [f"\\echo @@{mode}:{v}\nEXPLAIN (ANALYZE, FORMAT JSON) EXECUTE s9q('{v}');" for v in values]
-        script.append("SET plan_cache_mode = auto;")
-        script += ["\\echo @@warmup"] + ["EXECUTE s9q('pending');"] * 6 + ["\\echo @@auto:pending\nEXPLAIN (ANALYZE, FORMAT JSON) EXECUTE s9q('pending');"]
+        script += ["SET plan_cache_mode = auto;", "DEALLOCATE s9q;", script[1], "\\echo @@warmup"]
+        # Prime the new prepared statement with the common value, then switch to a rare one.
+        script += ["EXECUTE s9q('done');"] * 5 + ["\\echo @@auto:pending\nEXPLAIN (ANALYZE, FORMAT JSON) EXECUTE s9q('pending');"]
         plans = {k: PLAN.analyze(json.loads(v))["plans"][0] for k, v in blocks(self.c.psql("\n".join(script))).items() if ":" in k}
         generic_rare = plans["force_generic_plan:pending"]
         self.check("generic plan regression detected for a rare value",
                    "generic_plan_misestimate" in kinds(generic_rare) and generic_rare["uses_parameter_placeholders"], sorted(kinds(generic_rare)))
+        self.check("auto mode keeps the generic plan when parameters shift from common to rare",
+                   "generic_plan_misestimate" in kinds(plans["auto:pending"]), sorted(kinds(plans["auto:pending"])))
         self.check("custom plans for rare and frequent values have no misestimate",
                    not any("cardinality_mismatch" in kinds(plans[f"force_custom_plan:{v}"]) for v in values))
-        weighted = {m: sum(w * plans[f"{m}:{v}"]["execution_time_ms"] for v, w in values.items())
-                    for m in ("force_generic_plan", "force_custom_plan")}
-        # Recorded, not asserted: in this dataset the time impact is small and can be within noise on PG18.
+        distribution = [v for v, weight in values.items() for _ in range(round(weight * 10))]
+
+        def replay(mode):
+            setup = script[:2] + [f"SET plan_cache_mode = {mode};"]
+            # Warm both plans on the same values, then replay identical batches with six clients.
+            outcomes = self.c.psql("\n".join(setup + [f"EXECUTE s9q('{v}');" for v in values]))
+
+            def client(offset):
+                batch = distribution[offset:] + distribution[:offset]
+                commands = [f"\\echo @@{i}:{v}\nEXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) EXECUTE s9q('{v}');"
+                            for i, v in enumerate(batch)]
+                output = self.c.psql("\n".join(setup + commands))
+                return [(label.split(":", 1)[1], json.loads(document)[0])
+                        for label, document in blocks(output).items()]
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                started = time.monotonic()
+                observations = [pair for batch in pool.map(client, range(6)) for pair in batch]
+                elapsed = time.monotonic() - started
+            execution = sorted(plan["Execution Time"] for _, plan in observations)
+            rare_blocks = sum(plan["Plan"].get("Shared Hit Blocks", 0) + plan["Plan"].get("Shared Read Blocks", 0)
+                              for value, plan in observations if value != "done")
+            return outcomes, {"samples": len(execution), "mean_execution_ms": sum(execution) / len(execution),
+                              "p95_execution_ms": execution[(len(execution) * 95 + 99) // 100 - 1],
+                              "statements_per_second": len(execution) / elapsed, "rare_buffer_accesses": rare_blocks}
+
+        generic_result, generic = replay("force_generic_plan")
+        custom_result, custom = replay("force_custom_plan")
+        self.check("same results and fewer buffer accesses for rare values under concurrent replay",
+                   generic_result == custom_result and generic["samples"] == custom["samples"] == 60
+                   and 0 < custom["rare_buffer_accesses"] < generic["rare_buffer_accesses"] / 2,
+                   {"generic": generic, "custom": custom})
         generic_calls = self.c.value("SELECT count(*) FROM information_schema.columns WHERE table_name = 'pg_stat_statements' "
                                      "AND column_name = 'generic_plan_calls'") == "1"
-        self.measure(weighted_ms=weighted, auto_mode_used_generic=plans["auto:pending"]["uses_parameter_placeholders"],
+        self.measure(concurrent_replay={"clients": 6, "distribution": values, "generic": generic, "custom": custom},
+                     auto_mode_used_generic=plans["auto:pending"]["uses_parameter_placeholders"],
                      pgss_has_generic_plan_calls=generic_calls,
                      per_value_ms={k: v["execution_time_ms"] for k, v in plans.items()})
 
@@ -798,66 +833,60 @@ VACUUM ANALYZE;
         job = ("SET max_parallel_workers_per_gather = 0; SELECT /* s12_cpu */ count(*) FROM orders o CROSS JOIN generate_series(1, 6) k "
                "WHERE md5(o.note || k) LIKE '00%';")
 
-        def jobs(concurrency, count=6):
-            spans, lock, started = [], threading.Lock(), time.monotonic()
-            queue = list(range(count))
+        def jobs(concurrency):
+            spans, results = [], []
+            lock = threading.Lock()
 
-            def worker():
-                while True:
-                    with lock:
-                        if not queue:
-                            return
-                        n = queue.pop(0)
-                    begin = time.monotonic()
-                    self.c.psql(job)
-                    with lock:
-                        spans.append({"type": "request", "request_id": f"job{n}", "endpoint": "POST /report",
-                                      "pool_wait_ms": (begin - started) * 1000, "duration_ms": (time.monotonic() - started) * 1000})
-            threads = [threading.Thread(target=worker) for _ in range(concurrency)]
-            for t in threads:
-                t.start()
-            return threads, spans, started
+            def worker(n):
+                begin = time.monotonic()
+                result = self.c.psql(job).strip()
+                end = time.monotonic()
+                with lock:
+                    results.append(result)
+                    spans.append({"type": "request", "request_id": f"job{n}", "endpoint": "POST /report",
+                                  "pool_wait_ms": (begin - started) * 1000, "duration_ms": (end - started) * 1000})
+
+            def oom_count():
+                return int(self.c.shell("awk '$1 == \"oom_kill\" {print $2}' /sys/fs/cgroup/memory.events").stdout.strip())
+
+            oom_before = oom_count()
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                started = time.monotonic()
+                tasks = [pool.submit(worker, n) for n in range(6)]
+                with ThreadPoolExecutor(max_workers=1) as monitor:
+                    stats = monitor.submit(run, ["docker", "stats", "--no-stream", "--format", "{{json .}}", self.c.name])
+                    samples = self.c.sample(6, 0.35)
+                    resources = json.loads(stats.result().stdout)
+                for task in tasks:
+                    task.result()
+            trace = TRACE.analyze(json.dumps(span) for span in spans)["endpoints"][0]
+            elapsed = max(span["duration_ms"] for span in spans) / 1000
+            return {"samples": samples, "cpu_percent": float(resources["CPUPerc"].rstrip("%")),
+                    "memory_usage": resources["MemUsage"], "oom_kills": oom_count() - oom_before,
+                    "jobs_per_second": len(spans) / elapsed, "request_p95_ms": trace["p95_ms"],
+                    "pool_wait_p95_ms": trace["p95_pool_wait_ms"], "pool_wait_share": trace["pool_wait_share"],
+                    "results": sorted(results)}
 
         holder = {}
-
-        def saturated():
-            threads, spans, started = jobs(6)
-            time.sleep(1.0)
-            # OS-side CPU must be read while the load runs; docker stats samples for about a second.
-            stats = threading.Thread(target=lambda: holder.update(cpu=run(
-                ["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}", self.c.name]).stdout.strip()))
-            stats.start()
-            holder["samples"] = self.c.sample(6, 0.4)
-            stats.join()
-            for t in threads:
-                t.join()
-            holder["unlimited"] = (spans, time.monotonic() - started)
-
-        def pooled():
-            threads, spans, started = jobs(2)
-            for t in threads:
-                t.join()
-            holder["pooled"] = (spans, time.monotonic() - started)
-
-        unlimited = self.c.interval(saturated)
-        limited = self.c.interval(pooled)
-        samples = holder["samples"]
-        cpu_share = next((w["share"] for w in samples["wait_profile"] if w["wait"] == "CPU (no wait event)"), 0)
-        match = re.match(r"[0-9.]+", holder.get("cpu", ""))
-        cpu_percent = float(match.group()) if match else 0.0
-        self.check("CPU saturation: active sessions exceed CPUs and run without waits",
-                   samples["average_active_sessions"] >= 4 and cpu_share >= 0.7, {"aas": samples["average_active_sessions"],
-                                                                                    "cpu_share": cpu_share})
-        self.check("OS confirms saturation of the 2-CPU limit", cpu_percent >= 150, holder["cpu"])
+        unlimited = self.c.interval(lambda: holder.update(unlimited=jobs(6)))
+        limited = self.c.interval(lambda: holder.update(pooled=jobs(2)))
+        baseline, pooled = holder["unlimited"], holder["pooled"]
+        samples = baseline["samples"]
+        no_wait = next((w["share"] for w in samples["wait_profile"] if w["wait"] == "No reported wait event"), 0)
+        self.check("active sessions exceed CPU quota with few reported waits",
+                   samples["average_active_sessions"] >= 4 and no_wait >= 0.7,
+                   {"aas": samples["average_active_sessions"], "no_wait_share": no_wait})
+        self.check("OS confirms saturation of the 2-CPU limit", baseline["cpu_percent"] >= 150, baseline["cpu_percent"])
         q = self.c.qid("s12_cpu")
         comparison = COMPARE.compare(unlimited, limited, queryids=[q])["statements"][0]
         ratio = comparison["after_over_before"]["total_exec_time_per_call"]
-        throughput = [6 / holder["unlimited"][1], 6 / holder["pooled"][1]]
-        self.check("pool of 2 lowers DB time per query at similar throughput", ratio < 0.8 and throughput[1] > throughput[0] * 0.7,
-                   {"exec_ratio": ratio, "jobs_per_s": throughput})
-        pooled_trace = TRACE.analyze(json.dumps(s) for s in holder["pooled"][0])
-        self.check("pool wait is visible only in application timing", pooled_trace["endpoints"][0]["pool_wait_share"] > 0.2,
-                   pooled_trace["endpoints"][0])
+        self.check("concurrency cap lowers DB time per query at similar throughput with equal results",
+                   ratio < 0.8 and pooled["jobs_per_second"] > baseline["jobs_per_second"] * 0.7
+                   and pooled["results"] == baseline["results"],
+                   {"exec_ratio": ratio, "jobs_per_s": [baseline["jobs_per_second"], pooled["jobs_per_second"]]})
+        self.check("admission queue adds application-side wait despite lower DB execution time",
+                   pooled["pool_wait_share"] > 0.2 and pooled["pool_wait_p95_ms"] > baseline["pool_wait_p95_ms"],
+                   {"p95_ms": [baseline["pool_wait_p95_ms"], pooled["pool_wait_p95_ms"]]})
         self.c.psql("ALTER SYSTEM SET max_parallel_workers = 2; SELECT pg_reload_conf();")
         time.sleep(1)
         par = ("SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET max_parallel_workers_per_gather = 2; "
@@ -881,8 +910,94 @@ VACUUM ANALYZE;
         self.check("parallel worker shortfall detected", "parallel_worker_shortfall" in kinds(holder2["plan"])
                    or (planned is not None and launched is not None and launched < planned),
                    {"plan": sorted(kinds(holder2["plan"])), "pgss_to_launch": planned, "pgss_launched": launched})
-        self.measure(aas=samples["average_active_sessions"], docker_cpu=holder["cpu"], exec_ratio=ratio, jobs_per_second=throughput,
-                     not_reproduced="storage I/O latency (tmpfs)")
+        self.measure(concurrency_comparison={
+            label: {**{key: value for key, value in observed.items() if key not in ("samples", "results")},
+                    "average_active_sessions": observed["samples"]["average_active_sessions"],
+                    "db_exec_ms_per_call": comparison[period]["total_exec_time_per_call"]}
+            for label, period, observed in (("unlimited", "before", baseline), ("pooled", "after", pooled))
+        })
+
+
+def storage_scenario(image, directory, results, device):
+    """Measure a cold read against a real volume with a container-scoped I/O limit."""
+    print("[#4/#12] storage read latency", file=sys.stderr, flush=True)
+    c = Cluster(image, directory, tmpfs=False, docker_options=["--device-read-bps", f"{device}:8mb"],
+                extra_args=["-c", "track_io_timing=on", "-c", "shared_buffers=128MB"])
+    query = "SELECT /* s4_storage */ sum(id) FROM io_probe WHERE id BETWEEN 40000 AND 40099;"
+    observed = {}
+
+    def cold_cache():
+        c.psql("CHECKPOINT; SELECT pg_buffercache_evict_relation('io_probe');")
+        c.shell("""set -eu
+psql -XqAtc "SELECT pg_relation_filepath(oid) FROM pg_class WHERE oid IN
+    ('io_probe'::regclass, to_regclass('io_probe_id'))" |
+while IFS= read -r relation; do
+    dd if="$PGDATA/$relation" iflag=nocache count=0 status=none
+done""")
+
+    def disk_read_bytes():
+        stats = c.shell("cat /sys/fs/cgroup/io.stat").stdout.splitlines()
+        return next(int(re.search(r"\brbytes=(\d+)", line)[1]) for line in stats if line.split()[0] == volume)
+
+    def workload(label, sample=False):
+        before = disk_read_bytes()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(c.psql, "SET max_parallel_workers_per_gather = 0;\n" + query)
+            if sample:
+                time.sleep(0.2)
+                observed["waits"] = c.sample(8, 0.25)
+            observed[label] = {"result": pending.result().strip(), "disk_read_bytes": disk_read_bytes() - before}
+
+    try:
+        c.start()
+        volume = c.shell('findmnt -n -o MAJ:MIN -T "$PGDATA"').stdout.strip()
+        limits = c.shell("cat /sys/fs/cgroup/io.max").stdout.splitlines()
+        if not any(line.startswith(volume + " ") and "rbps=8388608" in line.split() for line in limits):
+            raise RuntimeError(f"8 MiB/s read cap is not active for PGDATA device {volume}")
+        c.psql("CREATE TABLE io_probe AS SELECT i AS id, repeat(md5(i::text), 8) AS payload "
+               "FROM generate_series(1, 160000) i; CREATE EXTENSION pg_stat_statements; "
+               "CREATE EXTENSION pg_buffercache; VACUUM ANALYZE io_probe;")
+        cold_cache()
+        baseline = c.interval(lambda: workload("baseline", sample=True))
+        c.psql("CREATE INDEX io_probe_id ON io_probe (id); VACUUM ANALYZE io_probe;")
+        c.psql("SELECT pg_buffercache_evict_relation('io_probe_id');")
+        cold_cache()
+        candidate = c.interval(lambda: workload("candidate"))
+
+        qid = c.qid("s4_storage")
+        comparison = COMPARE.compare(baseline, candidate, queryids=[qid])["statements"][0]
+        for label, period in (("baseline", "before"), ("candidate", "after")):
+            observed[label].update(comparison[period])
+        b, a = observed["baseline"], observed["candidate"]
+        query_waits = next((item for item in observed["waits"]["by_query_id"] if item["query_id"] == qid), {})
+        io_samples = sum(count for label, count in query_waits.get("top_waits", {}).items() if label.startswith("IO:"))
+        wait_share = io_samples / query_waits["samples"] if query_waits else 0
+        observed["io_wait_sample_share"] = wait_share
+        native = next(row["delta"] for row in baseline["deltas"]["io"]
+                      if row["identity"] == {"backend_type": "client backend", "object": "relation", "context": "bulkread"})
+        observed["native_bulkread"] = native
+        if "#4" in results:
+            results["#4"]["measurements"]["storage"] = observed
+            results["#4"]["checks"].extend([
+                {"check": "native byte and timing columns corroborate query I/O waits and relation reads",
+                 "ok": native.get("read_bytes", 0) > 0 and native.get("read_time", 0) > 0
+                 and wait_share > 0.5 and b["read_time_share"] > 0.5
+                 and any(row["identity"].get("relname") == "io_probe" for row in baseline["rankings"]["table_heap_reads"]),
+                 "detail": {"native_io": native, "query_waits": query_waits}},
+                {"check": "same cold-cache result with lower read volume, read time and response time",
+                 "ok": b["result"] == a["result"] == "4004950"
+                 and all(0 <= a[field] < b[field] / 2 for field in
+                         ("disk_read_bytes", "shared_read_bytes_per_call", "shared_blk_read_time_per_call", "total_exec_time_per_call")),
+                 "detail": comparison}])
+        if "#12" in results:
+            results["#12"]["measurements"]["storage"] = {"io_wait_sample_share": wait_share,
+                                                        "read_time_share": b["read_time_share"],
+                                                        "disk_read_bytes": b["disk_read_bytes"]}
+            results["#12"]["checks"].append({"check": "I/O waits corroborated by wait samples, SQL timing and cgroup disk reads",
+                                              "ok": wait_share > 0.5 and b["read_time_share"] > 0.5 and b["disk_read_bytes"] > 0,
+                                              "detail": results["#12"]["measurements"]["storage"]})
+    finally:
+        c.stop()
 
 
 def oom_scenario(image, directory, results):
@@ -894,21 +1009,28 @@ def oom_scenario(image, directory, results):
         cluster.start()
         query = ("SET max_parallel_workers_per_gather = 0; SET hash_mem_multiplier = 1; SET work_mem = '{}'; "
                  "SELECT count(*) FROM (SELECT g, count(*) FROM generate_series(1, 25000000) g GROUP BY g) s;")
-        failed = cluster.psql(query.format("4GB"), check=False, timeout=600)
+        def oom_count():
+            return int(cluster.shell("awk '$1 == \"oom_kill\" {print $2}' /sys/fs/cgroup/memory.events").stdout.strip())
+
+        initial = oom_count()
+        cluster.psql(query.format("4GB"), check=False, timeout=600)
         time.sleep(3)
-        events = cluster.shell("cat /sys/fs/cgroup/memory.events 2>/dev/null || true", user="root").stdout
-        oom_kills = int(re.search(r"oom_kill (\d+)", events).group(1)) if "oom_kill" in events else None
+        after_oversized = oom_count()
+        oom_kills = after_oversized - initial
         wait_until(lambda: run(["docker", "exec", cluster.name, "psql", "-h", "127.0.0.1", "-X", "-qAt", "-c", "SELECT 1"],
                                check=False).returncode == 0, 60)
         logs = cluster.logs()
         counts = logs["summary"]["event_counts"]
         checks.append({"check": "oversized work_mem: backend OOM-killed, classified from the log",
-                       "ok": bool(counts.get("backend_killed") or counts.get("out_of_memory")),
+                       "ok": oom_kills > 0 and bool(counts.get("backend_killed") or counts.get("out_of_memory")),
                        "detail": {"log_events": counts, "cgroup_oom_kill": oom_kills}})
         fine = cluster.psql(query.format("64MB"), check=False, timeout=600)
-        checks.append({"check": "budgeted work_mem completes (spilling to temp)", "ok": fine.strip().endswith("25000000"),
-                       "detail": fine.strip()[-40:]})
-        results["#12"]["measurements"]["oom"] = {"cgroup_oom_kill": oom_kills, "log_events": counts}
+        budgeted_kills = oom_count() - after_oversized
+        checks.append({"check": "budgeted work_mem completes without another OOM kill",
+                       "ok": fine.strip().endswith("25000000") and budgeted_kills == 0,
+                       "detail": {"result": fine.strip()[-40:], "cgroup_oom_kill": budgeted_kills}})
+        results["#12"]["measurements"]["oom"] = {"oversized_cgroup_oom_kill": oom_kills,
+                                                "budgeted_cgroup_oom_kill": budgeted_kills, "log_events": counts}
     finally:
         cluster.stop()
 
@@ -918,7 +1040,10 @@ def main(argv=None):
     parser.add_argument("--image", default="postgres:18-bookworm")
     parser.add_argument("--report", type=Path, help="Write the JSON evidence report here")
     parser.add_argument("--only", nargs="*", help="Issue numbers to run, e.g. 3 5 8 (setup always runs)")
+    parser.add_argument("--io-device", help="Docker host block device backing the PostgreSQL test volume, e.g. /dev/sda")
     args = parser.parse_args(argv)
+    if args.io_device and not re.fullmatch(r"/dev/[A-Za-z0-9_./-]+", args.io_device):
+        parser.error("--io-device must be a Docker host device path under /dev")
     if not re.fullmatch(r"(?:docker\.io/library/)?postgres:(?:18|19)[A-Za-z0-9_.-]*", args.image):
         parser.error("--image must be an official postgres:18... or postgres:19... tag")
     selected = set(args.only or [str(n) for n in range(3, 13)])
@@ -931,6 +1056,7 @@ def main(argv=None):
             cluster.start()
             version = cluster.value("SELECT version()")
             scenarios.setup()
+            pgss_version = cluster.value("SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'")
             for number in range(3, 13):
                 if str(number) in selected:
                     try:
@@ -944,13 +1070,28 @@ def main(argv=None):
         if failure:
             print(f"scenarios aborted: {failure}", file=sys.stderr)
             return 1
+        if selected & {"4", "12"}:
+            affected = [n for n in ("#4", "#12") if n in scenarios.results]
+            if args.io_device:
+                try:
+                    storage_scenario(args.image, directory, scenarios.results, args.io_device)
+                except Exception:
+                    for n in affected:
+                        scenarios.results[n]["checks"].append({"check": "storage scenario completed", "ok": False,
+                                                                "detail": traceback.format_exc(limit=-2)})
+            else:
+                for n in affected:
+                    scenarios.results[n]["measurements"]["storage"] = {"status": "skipped", "reason": "pass --io-device"}
+                print("[#4/#12] storage read latency skipped (pass --io-device)", file=sys.stderr)
         if "12" in selected:
             try:
                 oom_scenario(args.image, directory, scenarios.results)
             except Exception as exc:
                 scenarios.results["#12"]["checks"].append({"check": "OOM scenario completed", "ok": False, "detail": str(exc)})
-    report = {"image": args.image, "server_version": version, "results": scenarios.results}
+    report = {"image": args.image, "server_version": version, "pg_stat_statements_version": pgss_version,
+              "results": scenarios.results}
     if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     failed = 0
     for issue, result in scenarios.results.items():

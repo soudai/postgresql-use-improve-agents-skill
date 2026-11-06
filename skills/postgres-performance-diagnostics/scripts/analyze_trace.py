@@ -56,7 +56,8 @@ def analyze(lines, repeat=5, large_rows=10000, overfetch_ratio=0.1):
     requests, spans, malformed = load(lines)
     candidates, per_statement = [], defaultdict(lambda: {"calls": 0, "requests": set(), "max_per_request": 0,
                                                          "rows": 0, "locations": Counter()})
-    endpoints = defaultdict(lambda: {"durations": [], "sql_counts": [], "db_ms": 0.0, "pool_ms": 0.0, "total_ms": 0.0, "bytes": []})
+    endpoints = defaultdict(lambda: {"durations": [], "sql_counts": [], "db_ms": 0.0, "total_ms": 0.0,
+                                     "pool_waits": [], "pool_share_ms": 0.0, "pool_request_ms": 0.0, "bytes": []})
     for request_id in sorted(set(requests) | set(spans)):
         request, items = requests.get(request_id, {}), spans.get(request_id, [])
         endpoint = request.get("endpoint") or (items[0].get("endpoint") if items else None) or "unknown"
@@ -69,7 +70,10 @@ def analyze(lines, repeat=5, large_rows=10000, overfetch_ratio=0.1):
             stats["durations"].append(request["duration_ms"])
             stats["total_ms"] += request["duration_ms"]
         if number(request.get("pool_wait_ms")):
-            stats["pool_ms"] += request["pool_wait_ms"]
+            stats["pool_waits"].append(request["pool_wait_ms"])
+            if number(request.get("duration_ms")):
+                stats["pool_share_ms"] += request["pool_wait_ms"]
+                stats["pool_request_ms"] += request["duration_ms"]
         counts = Counter(statement_key(s) for s in items)
         for key, count in counts.items():
             info = per_statement[key]
@@ -111,7 +115,10 @@ def analyze(lines, repeat=5, large_rows=10000, overfetch_ratio=0.1):
                         "p50_ms": percentile(stats["durations"], 0.5), "p95_ms": percentile(stats["durations"], 0.95),
                         "p99_ms": percentile(stats["durations"], 0.99), "observed_requests": len(stats["durations"]),
                         "db_time_share": stats["db_ms"] / stats["total_ms"] if stats["total_ms"] else None,
-                        "pool_wait_share": stats["pool_ms"] / stats["total_ms"] if stats["total_ms"] else None})
+                        "p95_pool_wait_ms": percentile(stats["pool_waits"], 0.95),
+                        "pool_wait_observed_requests": len(stats["pool_waits"]),
+                        "pool_wait_share": (stats["pool_share_ms"] / stats["pool_request_ms"]
+                                            if stats["pool_request_ms"] else None)})
     statements = []
     for key, info in per_statement.items():
         kinds = Counter(c["kind"] for c in candidates if c["statement"] == key)
@@ -133,15 +140,16 @@ def analyze(lines, repeat=5, large_rows=10000, overfetch_ratio=0.1):
 
 def markdown(report, top=20):
     lines = ["# Application trace observations", "", f"Requests: {report['requests']}; malformed lines: {report['malformed_lines']}",
-             "", "## Endpoints", "", "| Endpoint | Requests | SQL/request (mean/max) | p95 ms | DB share | Pool wait share |",
-             "|---|---:|---:|---:|---:|---:|"]
+             "", "## Endpoints", "", "| Endpoint | Requests | SQL/request (mean/max) | p95 ms | DB share | Pool wait p95 ms | Pool wait share | Pool samples |",
+             "|---|---:|---:|---:|---:|---:|---:|---:|"]
 
     def cell(value, fmt="{:.2f}"):
         return "—" if value is None else fmt.format(value)
 
     for e in report["endpoints"]:
         lines.append(f"| {e['endpoint']} | {e['requests']} | {cell(e['sql_per_request_mean'])}/{e['sql_per_request_max']} | "
-                     f"{cell(e['p95_ms'])} | {cell(e['db_time_share'], '{:.0%}')} | {cell(e['pool_wait_share'], '{:.0%}')} |")
+                     f"{cell(e['p95_ms'])} | {cell(e['db_time_share'], '{:.0%}')} | {cell(e['p95_pool_wait_ms'])} | "
+                     f"{cell(e['pool_wait_share'], '{:.0%}')} | {e['pool_wait_observed_requests']} |")
     lines += ["", "## Statements", "", "| Statement | Classification | Calls | Calls/request | Rows/call | Code locations |",
               "|---|---|---:|---:|---:|---|"]
     for s in report["statements"][:top]:

@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 PER_CALL = ("total_exec_time", "rows", "shared_blks_hit", "shared_blks_read", "temp_blks_written", "wal_bytes",
-            "wal_fpi", "total_plan_time")
+            "shared_blk_read_time", "wal_fpi", "total_plan_time")
 SYSTEM = (("database", ("xact_commit", "xact_rollback", "temp_bytes", "deadlocks", "blks_read", "blks_hit",
                          "tup_returned", "tup_fetched", "active_time")),
           ("wal", ("wal_records", "wal_fpi", "wal_bytes", "wal_buffers_full")),
@@ -47,6 +47,7 @@ def profile(entry):
             "shared_hit_ratio": entry.get("shared_hit_ratio"), "read_time_share": entry.get("read_time_share")}
     for field in PER_CALL:
         data[f"{field}_per_call"] = ratio(delta.get(field), calls)
+    data["shared_read_bytes_per_call"] = ratio(entry.get("shared_read_bytes"), calls)
     return data
 
 
@@ -58,7 +59,7 @@ def compare_statement(before, after):
     if rate is not None and count is not None and abs(rate - 1) > LOAD_TOLERANCE and abs(count - 1) > LOAD_TOLERANCE:
         warnings.append(f"load differs: calls ratio {count:.2f}, calls/s ratio {rate:.2f}")
     if numeric(a["shared_hit_ratio"]) and numeric(b["shared_hit_ratio"]) and abs(a["shared_hit_ratio"] - b["shared_hit_ratio"]) > 0.2:
-        warnings.append("cache condition differs: shared hit ratio "
+        warnings.append("cache condition may differ: shared hit ratio "
                         f"{a['shared_hit_ratio']:.2f} -> {b['shared_hit_ratio']:.2f}")
     rows = ratio(b["rows_per_call"], a["rows_per_call"])
     if rows is not None and abs(rows - 1) > 0.01:
@@ -133,6 +134,14 @@ def markdown(result, top=20):
                                         cell(b["total_exec_time_per_call"]), cell(item["after_over_before"]["total_exec_time_per_call"]),
                                         f"{cell(a['rows_per_call'])}→{cell(b['rows_per_call'])}",
                                         "; ".join(item["warnings"]).replace("|", "\\|")]) + " |")
+    lines += ["", "## Shared reads per call", "",
+              "| queryid | Bytes before | Bytes after | Read ms before | Read ms after |",
+              "|---|---:|---:|---:|---:|"]
+    for item in result["statements"][:top]:
+        values = [f"{item['baseline_queryid']}→{item['candidate_queryid']}"]
+        for metric in ("shared_read_bytes_per_call", "shared_blk_read_time_per_call"):
+            values.extend(cell(item[period][metric]) for period in ("before", "after"))
+        lines.append("| " + " | ".join(values) + " |")
     lines += ["", "## System rates (per second)", "", "```json",
               json.dumps(result["system_per_second"], ensure_ascii=False, indent=2), "```", "", "## Limits", ""]
     lines += ["- " + x for x in result["limitations"]]

@@ -53,7 +53,8 @@ SPECS = {
 IDENTITY = ("relfilenode", "relname", "indexrelname", "schemaname", "relid")
 LIMITATIONS = [
     "Rankings are investigation candidates, not confirmed causes or universal thresholds.",
-    "A shared-buffer miss is not necessarily a physical disk read; correlate OS/storage metrics.",
+    "A shared-buffer miss can be served by the OS cache; correlate OS/storage metrics.",
+    "Read time divided by execution time is a signal. Concurrent waits can overlap and the ratio can exceed 1.",
     "pg_stat_io is cluster/backend/object/context data, not direct SQL or relation attribution.",
     "pg_stat_statements rows are returned/affected rows, not rows scanned. Calls alone do not prove N+1.",
     "Percentiles require individual execution observations; aggregate mean/stddev/max are insufficient.",
@@ -235,15 +236,18 @@ def section_deltas(before, after, name, warnings):
             # Logical buffer accesses track CPU/memory-bandwidth cost even when every access is a hit.
             result["shared_blks_accessed"] = (delta["shared_blks_hit"] + delta["shared_blks_read"]
                                               if {"shared_blks_hit", "shared_blks_read"} <= delta.keys() else None)
-            # Share of execution spent waiting on reads; low means a low hit ratio is not what users wait for.
+            # Keep the ratio even when overlapping waits exceed elapsed execution time.
             read_time = sum(delta[f] for f in ("shared_blk_read_time", "local_blk_read_time", "temp_blk_read_time")
                             if f in delta)
             result["read_time_share"] = (ratio(read_time, delta.get("total_exec_time"))
                                          if "shared_blk_read_time" in delta else None)
             result["toplevel"] = current.get("toplevel")
-        if name == "table_io":
-            result["heap_hit_ratio"] = (ratio(delta["heap_blks_hit"], delta["heap_blks_hit"] + delta["heap_blks_read"])
-                                        if {"heap_blks_hit", "heap_blks_read"} <= delta.keys() else None)
+        if name in ("table_io", "index_io"):
+            prefix = "heap" if name == "table_io" else "idx"
+            hit = delta.get(f"{prefix}_blks_hit")
+            read = delta.get(f"{prefix}_blks_read")
+            result[f"{prefix}_hit_ratio"] = ratio(hit, hit + read) if hit is not None and read is not None else None
+            result["shared_read_bytes"] = read * after["metadata"]["block_size"] if read is not None else None
         if name == "tables":
             result["hot_update_ratio"] = ratio(delta.get("n_tup_hot_upd"), delta.get("n_tup_upd"))
         if name == "database":
@@ -445,8 +449,10 @@ def analyze(before, after, top=10):
         "sql_calls": rank(sql, lambda x: x["delta"].get("calls")),
         "sql_temp_written_bytes": rank(sql, lambda x: x.get("temp_written_bytes")),
         "sql_shared_read_bytes": rank(sql, lambda x: x.get("shared_read_bytes")),
+        "sql_shared_read_ms": rank(sql, lambda x: x["delta"].get("shared_blk_read_time")),
         "sql_rows_per_call": rank(sql, lambda x: x.get("rows_per_call")),
         "table_heap_reads": rank(deltas["table_io"], lambda x: x["delta"].get("heap_blks_read")),
+        "index_reads": rank(deltas["index_io"], lambda x: x["delta"].get("idx_blks_read")),
         "table_seq_tuples": rank(deltas["tables"], lambda x: x["delta"].get("seq_tup_read")),
     }
     current = {}
@@ -501,19 +507,37 @@ def render_markdown(report):
              report['window']['note'], "",
              "Rankings identify candidates. An empty list is not a clean bill of health.", "", "## Data quality", ""]
     lines += ["- " + value for value in report["warnings"]] or ["- No detected discontinuity; see limitations."]
+    def cell(value):
+        if value is None:
+            return "—"
+        if isinstance(value, float):
+            return f"{value:.3f}"
+        return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
     for group, entries in report["rankings"].items():
-        lines += ["", "## " + group, "", "| Identity | Ranking value | share | calls | total ms | mean ms | rows/call | temp bytes | read bytes |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        prefix = {
+            "sql_shared_blks_accessed": "shared", "sql_shared_read_bytes": "shared",
+            "sql_shared_read_ms": "shared", "table_heap_reads": "heap", "index_reads": "idx",
+        }.get(group)
+        columns = (["Window s", "Hit blocks", "Read blocks", "Hit ratio", "Read bytes", "Read bytes/call",
+                    "Read ms", "Read ms/call"] if prefix else
+                   ["share", "calls", "total ms", "mean ms", "rows/call", "temp bytes", "read bytes"])
+        lines += ["", "## " + group, "", "| " + " | ".join(["Identity", "Ranking value", *columns]) + " |",
+                  "|---|" + "---:|" * (len(columns) + 1)]
         for entry in entries:
-            def cell(value):
-                if value is None:
-                    return "—"
-                if isinstance(value, float):
-                    return f"{value:.3f}"
-                return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
-            values = [json.dumps(entry["identity"], ensure_ascii=False), entry["ranking_value"], entry.get("exec_time_share"),
-                      entry["delta"].get("calls"),
-                      entry["delta"].get("total_exec_time"), entry.get("mean_exec_ms"), entry.get("rows_per_call"),
-                      entry.get("temp_written_bytes"), entry.get("shared_read_bytes")]
+            delta = entry["delta"]
+            if prefix:
+                calls = delta.get("calls")
+                read_bytes = entry.get("shared_read_bytes")
+                read_ms = delta.get("shared_blk_read_time")
+                metrics = [entry["elapsed_seconds"], delta.get(f"{prefix}_blks_hit"), delta.get(f"{prefix}_blks_read"),
+                           entry.get(f"{prefix}_hit_ratio"), read_bytes, ratio(read_bytes, calls),
+                           read_ms, ratio(read_ms, calls)]
+            else:
+                metrics = [entry.get("exec_time_share"), delta.get("calls"), delta.get("total_exec_time"),
+                           entry.get("mean_exec_ms"), entry.get("rows_per_call"), entry.get("temp_written_bytes"),
+                           entry.get("shared_read_bytes")]
+            values = [json.dumps(entry["identity"], ensure_ascii=False), entry["ranking_value"], *metrics]
             lines.append("| " + " | ".join(cell(value) for value in values) + " |")
         if not entries:
             lines += ["", "No comparable positive samples."]

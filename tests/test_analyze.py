@@ -137,6 +137,31 @@ class IntervalTests(unittest.TestCase):
         self.assertNotIn("shared_blk_read_time", report["deltas"]["pgss"][0]["delta"])
         self.assertTrue(any("track_io_timing" in x for x in report["warnings"]))
 
+    def test_io_ranking_and_native_bytes_without_operation_size_assumption(self):
+        a, b = pair()
+        for snap, reads, hits in ((a, 0, 0), (b, 3, 9)):
+            snap["sections"]["io"]["rows"] = [{"backend_type": "client backend", "object": "relation",
+                "context": "normal", "reads": reads, "read_bytes": reads * 32768,
+                "read_time": reads * 2.5, "stats_reset": None}]
+            snap["sections"]["index_io"]["rows"] = [{"indexrelid": 1, "relname": "test_table",
+                "indexrelname": "test_index", "idx_blks_read": reads, "idx_blks_hit": hits}]
+        report = MODULE.analyze(a, b)
+        native = report["deltas"]["io"][0]["delta"]
+        self.assertEqual(native["read_bytes"], 98304)
+        self.assertEqual(native["read_time"], 7.5)
+        self.assertEqual(report["rankings"]["sql_shared_read_ms"][0]["ranking_value"], 1)
+        index = report["rankings"]["index_reads"][0]
+        self.assertEqual(index["shared_read_bytes"], 24576)
+        self.assertEqual(index["idx_hit_ratio"], .75)
+
+        del b["sections"]["io"]["rows"][0]["read_bytes"]
+        for setting in b["sections"]["settings"]["rows"]:
+            if setting["name"] == "track_io_timing":
+                setting["setting"] = "off"
+        report = MODULE.analyze(a, b)
+        self.assertEqual(report["deltas"]["io"][0]["delta"], {"reads": 3})
+        self.assertEqual(report["rankings"]["sql_shared_read_ms"], [])
+
     def test_zero_calls_and_zero_hit_denominator(self):
         a, b = pair()
         for field in ("calls", "shared_blks_read", "shared_blks_hit"):
