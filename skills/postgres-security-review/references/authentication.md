@@ -14,3 +14,13 @@
 PGDATA、WAL、tablespace、設定、TLS鍵、ログ、バックアップ、password fileの実効アクセスを調べる。Unix modeは共有グループ・親ディレクトリ・ACLも確認する。[サーバ鍵](https://www.postgresql.org/docs/current/ssl-tcp.html)のroot所有0640は許容される構成だが、modeだけでは安全性や起動可否を証明しない。対象PIDの実効UID・GID・補助グループ、鍵の所有グループ、ACL、親ディレクトリと承認済み利用者を照合する。鍵の内容を読まず、サービスと非承認主体の実効アクセスを確認する。runtime.filesのservice_readableとunauthorized_accessに確認結果を記録し、未確認は省略する。読取不可または非承認主体のアクセスはfinding、証拠不足はunknown。passは指定した鍵と観測時点のアクセスに限定され、TLS接続全体の保証ではない。WindowsではACL、managedでは提供元の責任分界、object storageでは共有・暗号化・復元に必要な権限を確認する。
 
 argv、環境、CI、設定、FDW、subscriptionの秘密露出が疑われる場合は、権限のある担当者が所在だけを分類する。環境変数、接続文字列、鍵の内容のダンプは避ける。影響する秘密を更新し、必要な書込み先だけ許可して、起動、接続、保守、バックアップを隔離環境で再検証する。
+
+
+## 再発行・権限制限後の受入確認
+
+- パスワードの再発行では、保持中の接続と新規接続を別に試す。旧資格情報による新規接続の拒否、新資格情報での成功を確認し、poolの接続を排出・再作成して再接続できることを確認する。既存接続が動くことだけを成功条件にしない。
+- SCRAM非対応のclientが残る経路では、HBAがmd5でも保存形式がSCRAMなら認証方式が切り替わる。clientとpoolerの対応を事前に確認する。再発行後に旧方式へ戻すことを通常の復旧にせず、対応clientと新資格情報で回復する。
+- TLSの試験は許可するIPv4/IPv6の経路ごとに、正しいCA・名前での成功、不正なCA・名前と平文接続の拒否を確認する。別のローカル管理経路が必要なら、変更後も使えることを確認する。
+- backupやデータ領域の権限を狭めた後は、非承認主体の拒否に加え、実サービス主体の再起動、必要な書込み、dumpと別DBへのrestoreを検証する。読み取りのmode判定だけを業務継続の保証としない。
+
+リポジトリの隔離試験の追加例は `tests/security_auth_acceptance.py`。MD5のみ対応するprotocol client fixtureを実serverへ接続し、SASL拒否を確認する。これは特定の旧libpq/driverや本番poolerを実機検証した結果ではない。配備するclient・poolerでは各製品の対応版と設定で再確認する。[認証方式の移行](https://www.postgresql.org/docs/18/auth-password.html)、[認証メッセージの形式](https://www.postgresql.org/docs/18/protocol-message-formats.html)、[libpqの証明書検証](https://www.postgresql.org/docs/18/libpq-ssl.html)

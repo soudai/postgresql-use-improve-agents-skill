@@ -32,6 +32,10 @@ class Collector:
         env = {**os.environ, "PGAPPNAME": "postgres-security-review",
                "PGCLIENTENCODING": "UTF8", "PGCONNECT_TIMEOUT": "5"}
         script = f"""BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+    'name', name, 'setting', setting, 'unit', unit, 'source', source) ORDER BY name)
+FROM pg_catalog.pg_settings
+WHERE name OPERATOR(pg_catalog.=) ANY (ARRAY['search_path', 'statement_timeout', 'lock_timeout', 'TimeZone']::pg_catalog.text[]);
 SET LOCAL search_path TO pg_catalog;
 SET LOCAL statement_timeout TO '{self.timeout}ms';
 SET LOCAL lock_timeout TO '1000ms';
@@ -53,7 +57,14 @@ COMMIT;
             state = re.search(r"(?m)^(?:ERROR|FATAL):\s+([0-9A-Z]{5})\b", result.stderr)
             raise CollectionError("sqlstate_" + state[1] if state else "connection_or_query_failed")
         try:
-            return json.loads(result.stdout)
+            lines = result.stdout.splitlines()
+            if len(lines) != 2:
+                raise ValueError("unexpected result count")
+            settings, value = (json.loads(line) for line in lines)
+            if not isinstance(settings, list) or not isinstance(value, dict):
+                raise ValueError("unexpected result type")
+            value["collection_settings"] = settings
+            return value
         except ValueError:
             raise CollectionError("invalid_query_output") from None
 

@@ -13,13 +13,13 @@
 
 ## バージョンとセキュリティ情報
 
-[公式の対応期限](https://www.postgresql.org/support/versioning/)と[アドバイザリ](https://www.postgresql.org/support/security/)を取得した日を記録する。server_version_numは上流の比較に使い、ディストリビューションやprovider独自版のパッチは稼働中のパッケージrelease、image digest、engine revisionで照合する。CVEの成立条件と影響componentを個別advisoryで確認する。コミュニティEOLとmanagedの延長サポートは別項目。拡張とclientはそれぞれのmaintainerの資料を確認する。
+[公式の対応期限](https://www.postgresql.org/support/versioning/)と[アドバイザリ](https://www.postgresql.org/support/security/)を取得した日を記録する。server_version_numは上流の比較に使い、ディストリビューションやprovider独自版のパッチは稼働中のパッケージrelease、image digest、engine revisionで照合する。CVEの成立条件と影響componentを個別advisoryで確認する。収集済み情報はsourceの文字列だけで信用せず、形式、公式2ページのURL、取得日、release/advisory行を検査する。欠落・期限切れ・空のsecurity一覧では正常と判定せず再取得を求める。server_versionとserver_version_numの不整合、未認識のvendor表記、取得済み一覧より新しいminorも追加調査とする。コミュニティEOLとmanagedの延長サポートは別項目。拡張とclientはそれぞれのmaintainerの資料を確認する。各CVEには個別advisory、確認日、修正minorを残す。upstream配布と確認した修正版では、そのCVEの版の条件についてのみpassとし、前回の問題の解消を追えるようにする。vendorの修正済み申告には稼働buildと公開根拠を要求し、upstream minorが古いという表示とbackport済みCVEを別に扱う。対象majorのrelease notesから追加作業を確認し、EOL majorの最終minorを推奨更新先と取り違えない。
 
 ## 適用・移行
 
 - マイナー更新では現在majorの修正版とrelease notesを確認し、停止・バイナリ更新・再起動・追加作業とHAへの順序を計画する。
 - メジャー移行ではdump/restore、pg_upgrade、レプリケーションを停止時間、容量、拡張・driver互換性、データ検証で比較する。pg_upgradeを使う場合は新バイナリで、選択した転送モードを指定して `--check` を実行する。提供元が管理する場合はその事前チェックとサポート対象に従う。
 - バックアップを別環境へ復元し、アプリ・管理接続、ACL、RLS、データと拒否ケースを試す。RPO/RTO、切替前の書込み停止、切替後の書込みを引き継ぐ方法、旧環境の破棄時点を決める。
-- pg_upgradeのlink方式では新cluster起動後の旧データ再使用を避ける。swap方式は転送途中から旧clusterが変更される。copy/cloneや論理移行でも新側の書込みは旧側へ自動反映されない。変更失敗後は採用方式に応じて再修正、復元、再同期を選ぶ。
+- pg_upgradeのlink方式では新cluster起動後の旧データ再使用を避ける。swap方式は転送途中から旧clusterが変更される。copy/cloneや論理移行でも新側の書込みは旧側へ自動反映されない。新側で業務書込みを受け付けた後、未同期の旧側へ接続先だけを戻すとその書込みを失う。切替前から書込みの停止・保存・再適用/逆同期の方法とRPOを計画し、変更失敗後は採用方式に応じて再修正、復元、再同期を選ぶ。
 
 参照: [Upgrading a PostgreSQL Cluster](https://www.postgresql.org/docs/current/upgrading.html)、[pg_upgrade](https://www.postgresql.org/docs/current/pgupgrade.html)、[Backup and Restore](https://www.postgresql.org/docs/current/backup.html)。

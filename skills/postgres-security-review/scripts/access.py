@@ -102,10 +102,14 @@ def roles(review, access):
             continue
         inherited = access.walk(actor, "inherit_option")
         switched = access.walk(actor, "set_option")
-        power = []
+        power, unverified = [], []
         for target, path in switched.items():
+            attrs = access.roles.get(target, {})
+            absent = [flag for flag in ROLE_FLAGS if type(attrs.get(flag)) is not bool]
+            if absent:
+                unverified.append({"role": access.name(target), "path": access.path(path), "attributes": absent})
             for flag in ROLE_FLAGS:
-                if access.roles.get(target, {}).get(flag) and flag not in spec.get("allow_flags", []):
+                if attrs.get(flag) is True and flag not in spec.get("allow_flags", []):
                     power.append(f"{access.path(path)}: {flag}")
         # Built-in groups can confer ordinary privileges through inheritance, or after SET ROLE.
         for target, path in switched.items():
@@ -114,8 +118,14 @@ def roles(review, access):
                 if group_name in BROAD_ROLES and group_name not in spec.get("allow_groups", []):
                     power.append(f"{access.path(path + suffix[1:])}: {group_name}")
         if power:
-            role_finding(review, "ROLE", name, sorted(set(power)),
+            evidence = ({"capabilities": sorted(set(power)), "unverified_attributes": unverified}
+                        if unverified else sorted(set(power)))
+            role_finding(review, "ROLE", name, evidence,
                          "Runtime role has only explicitly allowed administrative capabilities.")
+        elif unverified:
+            review.missing("ROLE", name,
+                           "Observed administrative attributes for the login and each reachable SET ROLE target",
+                           {"unverified_attributes": unverified})
         elif not spec.get("allow_flags") and not spec.get("allow_groups"):
             review.add("ROLE", name, "pass", "info", "No reviewed administrative capability found.",
                        "No administrative capability required.", "Retain role separation.",

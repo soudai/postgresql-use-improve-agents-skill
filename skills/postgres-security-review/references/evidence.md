@@ -70,3 +70,6 @@ TLS鍵のUnix観測は次の形でruntimeに記録する。platformはLinuxを�
 ```
 
 上の例は追加調査になる。対象サービスとして読めることと、非承認主体が読めないことを確認できた場合のみ、同じfileへ`service_readable: true`と`unauthorized_access: false`を記録する。例のUID・版・時刻を実測に置き換え、秘密鍵本文は入力しない。
+
+
+snapshotの`collection_settings`は、collector自身のSET LOCALより前の`search_path`、`statement_timeout`、`lock_timeout`、`TimeZone`の有効値・単位・sourceを保持する。通常収集の安全な一時設定とは分け、接続先・ロールに設定されていた値として読む。任意の設定や接続文字列を収集する機能ではない。[pg_settings](https://www.postgresql.org/docs/18/view-pg-settings.html)、[SET LOCALの有効範囲](https://www.postgresql.org/docs/18/sql-set.html)

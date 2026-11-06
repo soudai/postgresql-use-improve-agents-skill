@@ -292,6 +292,39 @@ def safe_url(value):
         parts.username or parts.password or parts.query or parts.fragment)
 
 
+def advisory_source_complete(source, today):
+    """Recognize the offline collector contract; a source label alone is not provenance."""
+    if not isinstance(source, dict) or type(source.get("schema_version")) is not int or source["schema_version"] != 1:
+        return False
+    urls = source.get("urls")
+    if (source.get("source") != "postgresql.org" or not isinstance(urls, list)
+            or not all(isinstance(url, str) for url in urls)
+            or set(urls) != {"https://www.postgresql.org/support/versioning/",
+                             "https://www.postgresql.org/support/security/"}):
+        return False
+    try:
+        if not 0 <= (today - observed_date(source["retrieved_at"])).days <= 7:
+            return False
+        releases, advisories = source["releases"], source["advisories"]
+        if not isinstance(releases, dict) or not releases or not isinstance(advisories, list) or not advisories:
+            return False
+        for major, release in releases.items():
+            if not re.fullmatch(r"\d+(?:\.\d+)?", major) or type(release["minor"]) is not int or release["minor"] < 0:
+                return False
+            date.fromisoformat(release["end"])
+        for advisory in advisories:
+            if (not re.fullmatch(r"CVE-\d{4}-\d{4,}", advisory["cve"])
+                    or advisory["component"] not in {"server", "client", "other"}
+                    or not isinstance(advisory["fixed"], dict)):
+                return False
+            if any(not re.fullmatch(r"\d+(?:\.\d+)?", major)
+                   or type(minor) is not int or minor < 0 for major, minor in advisory["fixed"].items()):
+                return False
+        return any(a["component"] == "server" and a["fixed"] for a in advisories)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def versions(review):
     identity = review.snapshot["identity"]
     version_num = identity["version_num"]
@@ -301,22 +334,29 @@ def versions(review):
         release_finding(review, "RELEASE", "server", "finding", {"major": major, "stage": "preview"},
                         "Production targets use a supported final release.")
         return
+    current = version_num % (10000 if version_num >= 100000 else 100)
+    expected_prefix = major + "." + str(current)
+    if not re.match(re.escape(expected_prefix) + r"(?:$|[\s(-])", version):
+        review.missing("RELEASE", "server", "Recognized, consistent server_version and server_version_num")
+        return
     source = review.advisories
-    if not source or source.get("source") != "postgresql.org" or not 0 <= (
-        review.today - observed_date(source["retrieved_at"])).days <= 7:
-        review.missing("RELEASE", "server", "Fresh official release and security evidence")
+    if not advisory_source_complete(source, review.today):
+        review.missing("RELEASE", "server", "Fresh complete official release and security evidence with its source URLs")
         return
     release = source.get("releases", {}).get(major)
     if release is None:
         review.missing("RELEASE", "server", "Recognized upstream release series")
         return
+    if current > release["minor"]:
+        review.missing("RELEASE", "server", "Official or vendor evidence for a runtime version newer than this feed")
+        return
     deployment = review.contract.get("distribution", {})
     bound = in_scope(review, deployment)
     upstream = bound and deployment.get("type") == "upstream"
     end = date.fromisoformat(release["end"])
-    current = version_num % (10000 if version_num >= 100000 else 100)
     release_finding(review, "LIFECYCLE", "community", "finding" if (end - review.today).days <= 90 else "pass",
-                    {"major": major, "community_end": end.isoformat(), "days_remaining": (end - review.today).days},
+                    {"major": major, "community_end": end.isoformat(), "days_remaining": (end - review.today).days,
+                     "retrieved_at": source["retrieved_at"]},
                     "Use a supported series and plan migration before community end of life.")
     if bound and deployment.get("type") == "managed":
         support = deployment.get("extended_support", {})
@@ -327,7 +367,10 @@ def versions(review):
         else:
             review.missing("LIFECYCLE", "provider", "Evidence of the provider's applied support plan")
     release_finding(review, "RELEASE", "server", "finding" if current < release["minor"] else "pass",
-                    {"major": major, "running_minor": current, "upstream_minor": release["minor"]},
+                    {"major": major, "running_minor": current, "upstream_minor": release["minor"],
+                     "retrieved_at": source["retrieved_at"],
+                     "release_notes": "https://www.postgresql.org/docs/" + major + "/release-" +
+                                      major.replace(".", "-") + "-" + str(release["minor"]) + ".html"},
                     "Review current minor release and vendor patch status.")
     build = deployment.get("build", "")
     build_known = bound and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+@:\\-]{0,199}", build))
@@ -344,10 +387,12 @@ def versions(review):
         if proven:
             status = "finding" if claim["state"] == "affected" else "pass"
             evidence = {"vendor_state": claim["state"], "vendor_source": claim["source"], "build": build}
-        elif current < fixed:
-            status, evidence = "unknown", {"upstream_fixed_minor": fixed, "running_minor": current}
         else:
-            continue
+            status = "pass" if upstream and current >= fixed else "unknown"
+            evidence = {"upstream_fixed_minor": fixed, "running_minor": current,
+                        "distribution": "upstream" if upstream else "unconfirmed vendor patch status"}
+        evidence["upstream_fixed_minor"] = fixed
+        evidence["retrieved_at"] = source["retrieved_at"]
         evidence["advisory"] = "https://www.postgresql.org/support/security/" + cve + "/"
         release_finding(review, "CVE", cve, status, evidence,
                         "Check component, exposure conditions and vendor package/build before concluding impact.")
