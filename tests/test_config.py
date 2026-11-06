@@ -61,7 +61,8 @@ def interval(timed, requested, elapsed=3600, wal_rate=10 * 1024 ** 2, temp=0, ji
         "checkpointer": [{"elapsed_seconds": elapsed, "delta": {"num_timed": timed, "num_requested": requested}}],
         "wal": [{"delta": {"wal_records": 1000, "wal_fpi": 100}, "per_second": {"wal_bytes": wal_rate}}],
         "database": [{"per_second": {"temp_bytes": temp}, "average_active_sessions": 3}],
-        "pgss": [{"toplevel": True, "delta": {"total_exec_time": 1000, "jit_generation_time": jit}}]}}
+        "pgss": [{"toplevel": True, "delta": {"total_exec_time": 1000, "jit_generation_time": jit, "jit_inlining_time": 0,
+            "jit_optimization_time": 0, "jit_emission_time": 0}}]}}
 
 
 class ConfigTests(unittest.TestCase):
@@ -122,18 +123,19 @@ class ConfigTests(unittest.TestCase):
         _, found = run(settings(), interval(12, 0, temp=1024 ** 2), ram_gb=64, max_active_connections=20)
         self.assertEqual(found["work_mem"]["scope"], "role/session")
 
-    def test_requested_checkpoints_raise_max_wal_size(self):
+    def test_requested_checkpoints_require_cause_evidence(self):
         _, found = run(settings(), interval(4, 8))
-        self.assertEqual(found["max_wal_size"]["severity"], "high")
-        # 10MB/s * 300s * 2 = 6000MB -> rounded up to whole GB.
-        self.assertEqual(found["max_wal_size"]["recommended"], "6GB")
+        self.assertEqual(found["max_wal_size"]["severity"], "medium")
+        self.assertIsNone(found["max_wal_size"]["recommended"])
+        self.assertEqual(found["max_wal_size"]["evidence"]["cause"], "unknown")
         result, found = run(settings(), interval(1, 2, elapsed=600))
         self.assertNotIn("max_wal_size", found)
         self.assertIn("interval shorter", json.dumps(result["not_evaluated"]))
 
     def test_jit_evidence_and_storage_rules(self):
         _, found = run(settings(), interval(12, 0, jit=200), storage="ssd")
-        self.assertEqual(found["jit"]["severity"], "high")
+        self.assertEqual(found["jit"]["severity"], "medium")
+        self.assertIsNone(found["jit"]["recommended"])
         self.assertEqual(found["random_page_cost"]["recommended"], "1.1")
         _, found = run(settings(), storage="hdd")
         self.assertNotIn("random_page_cost", found)

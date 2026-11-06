@@ -180,3 +180,45 @@ python tests/security_regressions.py --image postgres:19rc1-bookworm
 ```
 
 試験はネットワークを分離した使い捨てDBで、子のRLSによる許可・拒否、TLS鍵の実効アクセス、失効した資格情報の新規接続拒否を確認します。詳細は[検証手順](skills/postgres-security-review/references/validation.md)を参照してください。
+
+## テーブル設計をレビューする
+
+[postgres-schema-review](skills/postgres-schema-review/SKILL.md)は、FKの不足、命名、NULL・flagの意味、ライフサイクル・責務の混在、不変にすべき事実の更新、同一行への更新競合を診断します。対象schemaのcatalogと、業務の設計契約・読み書きの観測を照合し、確定した不一致・改善候補・追加調査・根拠付き例外を区別します。Issue [#33](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/33)〜[#37](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/37)に対応します。
+
+```powershell
+python skills/postgres-schema-review/scripts/collect.py --schema public --output snapshots/schema.json
+python skills/postgres-schema-review/scripts/review.py snapshots/schema.json --contract contract.json --evidence evidence.json --format markdown --output reports/schema.md
+```
+
+[設計契約の例](skills/postgres-schema-review/assets/contract.example.json)と[観測情報の例](skills/postgres-schema-review/assets/evidence.example.json)を、実際の業務資料・コード・traceに合わせて用意します。入力形式、収集範囲と証拠の作り方は[入力手順](skills/postgres-schema-review/references/evidence.md)を参照してください。JSON形式のレポートも出力できます。
+
+collectorはPython標準ライブラリとpsqlで単独利用でき、DDLや行データを自動操作しません。設計意図とtraceの正規化には業務知識が必要です。観測していない処理、収集上限、権限による統計欠測をレポートに残します。現在状態の表、nullable FK、独立したBooleanの存在だけでは違反としません。
+
+```powershell
+python tests/schema_scenarios.py --image postgres:18-bookworm
+python tests/schema_scenarios.py --image postgres:19rc1-bookworm
+```
+
+検証した範囲と移行時の確認は[変更計画と検証](skills/postgres-schema-review/references/refactoring.md)を参照してください。
+
+
+## 証拠を限定した診断と互換性
+
+不明な情報を0や合格として扱わず、観測した事実と原因の仮説を分けて報告します。
+
+- activity sampleは出力v2です。権限やactivity追跡の不足があるとAAS・peakはnullとなり、観測できた下限と不足理由を別に出します。旧sampleを再集計する場合も追跡状態の証拠がなければ不明になります。
+- 計画の`$n`だけではgeneric planと断定しません。`--plan-mode`と`--plan-source`で採取時の根拠を記録します。BRINのlossy bitmapは本来の性質であり、メモリ不足の証拠とは限りません。`--relation-evidence`で同じ対象の索引方式を補えます。
+- 設定のcheckpoint要求比率は原因の追加調査、JIT比率は同条件ON/OFF試験の候補です。単独の比率から変更値や効果を断定しません。
+- schema snapshot v2は列とdomainのNOT NULL、制約の検証・強制状態を区別します。v1も読めますが、合成された`not_null: true`を列の保証として使わず、再収集を求めます。設計契約・観測情報の形式はv1のままです。
+- workload report v2は正しさ、観測したSLO、証拠の十分性を分けます。旧入力も読めますが、採用候補には`--policy`で代表負荷と試行数・件数・時間・ばらつきの検証計画が必要です。欠測があっても確認できた違反は残し、中央値の差だけでは因果的な改善を断定しません。
+
+監査の反例を再現する追加試験（ローカルの使い捨てDBのみ）:
+
+```sh
+python tests/performance_evidence_scenarios.py --images postgres:18-bookworm
+python tests/performance_evidence_scenarios.py --images postgres:19rc1-bookworm
+python tests/config_workload_evidence_scenarios.py --image postgres:18-bookworm
+python tests/config_workload_evidence_scenarios.py --image postgres:19rc1-bookworm
+```
+
+schemaの反例は`tests/schema_scenarios.py`に含みます。短い負荷試験は診断とログ解析の動作確認であり、本番の性能改善や採用の根拠ではありません。

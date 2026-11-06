@@ -1,0 +1,45 @@
+# 設計診断の判定基準
+
+## 設計上の軸と出典
+
+soudai1025さんの[変化に強いテーブル設計の勘所](https://speakerdeck.com/soudai/table-design-that-is-resistant-to-changes)では、1テーブル1責務、事実と導出情報の区別、小さな変更範囲が示される。[アジャイル開発とデータベース設計](https://agilejourney.uzabase.com/entry/2022/07/28/103000)の認証方式追加の例は、属性の用途と独立して変化する条件を確認する手掛かりになる。NULLやbooleanを一律に禁止する規則とは扱わない。
+
+[パフォーマンス改善編](https://speakerdeck.com/soudai/make-what-is-needed)のライフサイクルに合わせた分割と、[表示順を別テーブルにする例](https://soudai.hatenablog.com/entry/2022/01/27/114257)を、更新の責務・頻度・競合を調べる参考にする。分割後も一体として守る必要がある整合性を定める。
+
+soudaiさんが参照する[川島さんのイミュータブルデータモデル](https://scrapbox.io/kawasima/イミュータブルデータモデル)は、リソースとイベントの区別に使う。発生した事実、現在状態、有効期間・期限、取込・監査時刻の意味を分ける。
+
+以下のルールは、これらの考え方を診断に使うための本skillの具体化であり、著者が定めた機械判定の規約ではない。
+
+## ルール
+
+| ID | 根拠と改善候補 | 正常例・追加調査 |
+| --- | --- | --- |
+| schema.fk | 契約された関連とFKの列対応、検証・enforcement、MATCH、NULL、削除動作を照合する。tenantを含む複合参照も確認 | 外部ID・非同期整合性・独立した履歴値。欠測時は制約の不存在を確定しない |
+| schema.naming | 合意した表名・列名とcatalogを照合する。用語集と周辺コードでtypoや多義性を確認 | 独自語や許容略語。改名はORM、SQL、BI、ETL、APIの互換性を調べる |
+| schema.null | 常時必須列のnullable定義、状態別の必須性違反、異なる意味のNULL混在を確認 | 未知、未確定、非該当を区別する。null_frac=0だけではNOT NULL追加を決めない |
+| schema.flag | 状態を表す複数flag、不可能な組合せ、イベント日時との重複、導出情報の正本を確認 | 独立した真偽属性は正常。論理削除は保持・一意性・参照の扱いまで確認する |
+| schema.lifecycle | 発生・確定・訂正・保存期間の異なる列群を確認し、独立した事実の分離を検討 | 日時列の個数だけで判定しない。単一の原子的な事実を分ける効果を確認 |
+| schema.responsibility | 独立した業務・更新者が違う列群を扱う構造、型で意味が変わる列を確認 | 意図的な参照モデル、集約表。列数・索引数は一律の閾値にしない |
+| schema.immutable | 不変であると合意した確定済み事実にUPDATE/DELETEがあるか、訂正履歴が残るか確認 | 下書き・現在状態・cache・保持期限による削除。SQL関数のIMMUTABLE属性と混同しない |
+| schema.contention | 複数業務の同一行更新と、実際のblocker・待機時間を結び付けて分割候補を示す | 長いtransaction、DDL、更新順序、採番・在庫の必要な直列化を比較する |
+
+FKの子側に索引がないことは、制約が存在しないこととは別の性能調査項目。参照先の一意性、複合キーの列対応、NULLのMATCH規則を確認する。CHECKは評価結果がNULLでも成立するため、CHECKがあるだけで必須性が保証されるとは扱わない。[制約仕様](https://www.postgresql.org/docs/18/ddl-constraints.html)
+
+NULLの保証は次のように評価する。
+
+- domain NOT NULLと列NOT NULLを分ける。domainの型変換時の検査は、既にdomain型となったNULLの保存を防がない場合がある。[CREATE DOMAIN](https://www.postgresql.org/docs/18/sql-createdomain.html#SQL-CREATEDOMAIN-NOTES)
+- NOT NULL NOT VALIDは新規INSERT/UPDATEを検査するが、既存行のNULLが残り得る。validated=falseの事実と、実際に観測したNULL件数を分けて報告する。既存行の修復とVALIDATE後の再収集まで保証を確定しない。[ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html)
+- MATCH FULLは部分NULLを拒否するが、全列NULLを許す。全列の必須性を推論するには、検証・強制済みのFKと、少なくとも1列の検証・強制済みの列NOT NULLが必要。domainや未検証のNOT NULLをその根拠にしない。[FKのNULL仕様](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK)
+- enforce:falseはFKを設けない意図だけを表す。allow_null:falseは別に評価し、FKの例外で必須性の指摘を消さない。
+- 検証済みの列保証とNULL実測が矛盾した場合だけ、環境・観測時点を再照合する。domainや未検証制約とNULL実測の併存は矛盾ではない。
+
+## 判定とレポート
+
+- confirmed: 出典のある設計契約との不一致、または範囲の明らかな違反観測を確認した。
+- candidate: 分割・改名等を検討する構造上の根拠がある。変更の必要性は追加評価する。
+- needs_evidence: 契約、収集範囲、時刻、動作などが不足する。
+- exception: 理由と出典がある意図的な例外。元の検出内容を保持する。
+
+重要度と確度を分ける。契約と一致する正常例で指摘が出なくても、未観測のルールまで合格したとは表現しない。高い確度の命名不一致が、高い確度のデータ整合性違反と同じ優先度になるわけではない。
+
+各指摘は対象、rule、status、severity、confidence、summary、evidence、recommendation、verification、missingを持つ。必要に応じてgroupで束ねる。例えば注文表の決済・配送の混在によるNULLとflagは、個々の根拠を残して同じライフサイクル分割候補にまとめる。出典から業務影響へ説明をつなぎ、未確認の因果関係を確定しない。

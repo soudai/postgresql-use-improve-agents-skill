@@ -22,12 +22,18 @@ python scripts/sample_activity.py --instance-id prod-primary --samples 60 --inte
 
 | 項目 | 意味 |
 | --- | --- |
-| average_active_sessions | クライアント／parallel workerのactiveな数の平均。CPUコア数と比べる |
+| average_active_sessions / peak_active_sessions | 取得できた各時点のクライアント／parallel workerのactive数の平均／最大。観測範囲が不完全ならnull |
+| observed_average_active_sessions / observed_peak_active_sessions | 観測できたactive数。権限不足・計測無効時は全体に対する下限 |
+| activity_coverage / unknown_session_samples | 観測範囲と、状態・種類を判定できない延べセッション数 |
 | wait_profile | active時間の待機内訳。`No reported wait event`は計測された待機イベントがない状態。CPU使用はOS指標で確認する |
 | by_query_id | 時間を使っているquery_idと、その主な待機。`pg_stat_statements`のqueryidと照合する |
 | lock_blockers | ロック待ちを生んだPIDと、待機者の観測回数 |
 | idle_in_transaction | トランザクションを開いたまま待つセッション。最大経過秒 |
 | background | autovacuum、checkpointer、walsender等の待機 |
+
+サンプラーの出力はschema version 2。`track_activities`の取得漏れ・無効化や、state／backend_typeの非表示を検出するとAASとpeakは`null`になり、`warnings`に理由を残す。旧サンプルで設定を取得していない場合も未確認になる。非表示のセッションをbackgroundや負荷0として扱わない。`unknown_session_samples=0`でも設定が未取得なら完全な観測とはいえない。`wait_profile`と`by_query_id`のshareは、見えたactiveセッションだけを母数とする。
+
+[統計の可視性](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-STATS-VIEWS)により、通常の利用者からは別ロールのセッション情報の一部が非表示になる。許可された監視ロール（`pg_read_all_stats`等）の利用を検討し、再採取で欠測が解消したか確認する。`track_activities`はバックエンドごとにも無効化できるため、採取側の設定がonでも他のセッションの`state=disabled`を調べる。権限変更や全体設定の変更を自動で行わない。
 
 average_active_sessionsがCPUコア数を継続的に超え、`CPU`の割合が高ければCPU飽和を疑い、OSのCPU使用率・run queueで確かめる。待機イベントのないactiveはCPU以外の未計測の待ちも含む。
 

@@ -284,7 +284,7 @@ class IntervalTests(unittest.TestCase):
                                  ("a_b_copy", "a_b", "duplicate")})
 
     def test_autovacuum_backlog_uses_reloptions_and_flags_partition_parents(self):
-        values = {"autovacuum": "on", "autovacuum_vacuum_threshold": "50", "autovacuum_vacuum_scale_factor": "0.2",
+        values = {"autovacuum": "on", "track_counts": "on", "autovacuum_vacuum_threshold": "50", "autovacuum_vacuum_scale_factor": "0.2",
                   "autovacuum_vacuum_max_threshold": "100000000", "autovacuum_analyze_threshold": "50",
                   "autovacuum_analyze_scale_factor": "0.1"}
         tables = [{"relname": "hot", "relkind": "r", "reltuples": 1000, "n_dead_tup": 500, "n_mod_since_analyze": 0},

@@ -68,6 +68,7 @@ def summarize(run, directory, conditions):
     return {
         "started_at": run["started_at"], "elapsed_seconds": elapsed,
         "complete": run.get("complete") is True and total > 0,
+        "event_count": total, "successful_count": counts["ok"],
         "result_digest": run.get("result_digest"), "counts": dict(counts),
         "offered_tps": total / elapsed, "completed_tps": counts["ok"] / elapsed,
         "loss_rate": (total - counts["ok"]) / total if total else None,
@@ -84,24 +85,65 @@ def read(path):
     return data["conditions"], [summarize(run, path.parent, data["conditions"]) for run in data["runs"]]
 
 
-def compare(before, after, limits, resource_limits, generator_cpu_max=None):
+def validate_policy(policy):
+    if policy is None:
+        return None
+    fields = {"schema_version", "source", "representative_workload", "min_runs",
+              "min_successful_events_per_run", "min_elapsed_seconds", "max_relative_spread"}
+    if not isinstance(policy, dict) or set(policy) != fields:
+        raise ValueError("validation policy requires documented fields")
+    if type(policy["schema_version"]) is not int or policy["schema_version"] != 1:
+        raise ValueError("unsupported validation policy version")
+    if not isinstance(policy["source"], str) or not policy["source"].strip():
+        raise ValueError("validation policy requires a source for the workload plan")
+    if type(policy["representative_workload"]) is not bool:
+        raise ValueError("representative_workload must be boolean")
+    for key, minimum in (("min_runs", 2), ("min_successful_events_per_run", 1)):
+        if type(policy[key]) is not int or policy[key] < minimum:
+            raise ValueError(key + " is below its supported minimum")
+    for key in ("min_elapsed_seconds", "max_relative_spread"):
+        if not measurement(policy[key]) or (key == "min_elapsed_seconds" and policy[key] == 0):
+            raise ValueError("invalid " + key)
+    return policy
+
+
+def compare(before, after, limits, resource_limits, generator_cpu_max=None, *, validation_policy=None):
+    policy = validate_policy(validation_policy)
     base_conditions, baseline = before
     next_conditions, candidate = after
     runs = baseline + candidate
     missing, regressions = [], []
-    if not base_conditions or base_conditions != next_conditions:
+    comparable = bool(base_conditions) and base_conditions == next_conditions
+    if not comparable:
         missing.append("missing or different replay conditions")
-    if len(baseline) < 2 or len(candidate) < 2:
-        missing.append("two or more runs required per variant")
+    minimum_runs = policy["min_runs"] if policy else 2
+    if len(baseline) < minimum_runs or len(candidate) < minimum_runs:
+        missing.append(f"{minimum_runs} or more runs required per variant")
     if any(not run["complete"] for run in runs):
         missing.append("missing or incomplete event logs")
+
+    # Correctness evidence is independent of performance sampling/OS metric coverage.
     digests = [run["result_digest"] for run in runs]
-    if not all(digests):
+    observed_mismatch = len({digest for digest in digests if digest}) > 1
+    if not digests or not all(digests):
         missing.append("missing result checks")
-    if not missing and len({digest for digest in digests if digest}) > 1:
+    if comparable and baseline and candidate and observed_mismatch:
+        correctness = "mismatch"
         regressions.append("result mismatch")
+    elif comparable and baseline and candidate and all(digests):
+        correctness = "match"
+    else:
+        correctness = "unknown"
+
     required = {"cpu_pct", "io_read_bytes", "wal_bytes", "oom_kills"}
+    if policy is None:
+        missing.append("validation policy missing: sample size, observation period, variability and representative workload")
+    elif not policy["representative_workload"]:
+        missing.append("representative workload not established by the validation plan")
     for group, observations in (("baseline", baseline), ("candidate", candidate)):
+        starts = [run["started_at"] for run in observations]
+        if len(set(starts)) != len(starts):
+            missing.append(f"{group}: repeated start times; confirm these are separate trials")
         for index, run in enumerate(observations, 1):
             absent = sorted(name for name in required if not measurement(run["metrics"].get(name)))
             if absent:
@@ -111,19 +153,32 @@ def compare(before, after, limits, resource_limits, generator_cpu_max=None):
                 missing.append(f"{group} {index}: missing load generator CPU")
             elif generator_cpu_max is not None and cpu > generator_cpu_max:
                 missing.append(f"{group} {index}: load generator saturated ({cpu}%)")
+            if policy:
+                count = run.get("successful_count", run["counts"].get("ok", 0))
+                if count < policy["min_successful_events_per_run"]:
+                    missing.append(f"{group} {index}: insufficient successful events for latency percentiles")
+                if run["elapsed_seconds"] < policy["min_elapsed_seconds"]:
+                    missing.append(f"{group} {index}: observation period below validation plan")
+
+    slo_violations = []
+    slo_missing = not bool(candidate)
     for index, run in enumerate(candidate, 1):
         for name, limit in limits.items():
             value = run[name]
             if value is None:
                 missing.append(f"candidate {index}: missing {name}")
+                slo_missing = True
             elif (value < limit if name == "completed_tps" else value > limit):
-                regressions.append(f"candidate {index}: {name}={value} violates {limit}")
+                message = f"candidate {index}: {name}={value} violates {limit}"
+                slo_violations.append(message)
+                regressions.append(message)
         for name, limit in resource_limits.items():
             value = run["metrics"].get(name)
             if not measurement(value):
                 missing.append(f"candidate {index}: missing {name}")
             elif value > limit:
-                regressions.append(f"candidate {index}: {name}={value} exceeds {limit}")
+                message = f"candidate {index}: {name}={value} exceeds {limit}"
+                regressions.append(message)
 
     def spread(group):
         result = {}
@@ -133,11 +188,32 @@ def compare(before, after, limits, resource_limits, generator_cpu_max=None):
         return result
 
     baseline_spread, candidate_spread = spread(baseline), spread(candidate)
+    relative_spreads = {}
+    for label, group in (("baseline", baseline_spread), ("candidate", candidate_spread)):
+        relative_spreads[label] = {}
+        for name in ("p95_ms", "completed_tps"):
+            values = group[name]
+            relative = ((values[2] - values[0]) / values[1] if values[1] > 0
+                        else 0 if values[2] == values[0] else None) if values else None
+            relative_spreads[label][name] = relative
+            if policy and (relative is None or relative > policy["max_relative_spread"]):
+                missing.append(f"{label}: {name} variability is missing or exceeds the validation plan")
     changes = {name: candidate_spread[name][1] - values[1]
                for name, values in baseline_spread.items() if values and candidate_spread[name]}
-    return {"decision": "investigate" if missing else "rollback_candidate" if regressions else "accept_candidate",
-            "missing": missing, "regressions": regressions, "baseline": baseline, "candidate": candidate,
-            "median_change": changes,
+    # Preserve observed violations even when another assessment lacks evidence.
+    decision = "rollback_candidate" if regressions else "investigate" if missing else "accept_candidate"
+    return {"schema_version": 2, "decision": decision,
+            "correctness": {"status": correctness, "observed_digest_difference": observed_mismatch,
+                            "conditions_comparable": comparable},
+            "performance": {"status": "slo_violations_observed" if slo_violations else
+                            "unknown" if slo_missing else "slo_met_in_observed_runs",
+                            "violations": slo_violations},
+            "evidence_quality": {"status": "insufficient" if missing else "sufficient_for_declared_plan",
+                                 "policy": policy, "relative_spreads": relative_spreads},
+            "improvement": {"status": "not_established",
+                            "reason": "SLO compliance and median differences alone do not establish a causal improvement."},
+            "missing": list(dict.fromkeys(missing)), "regressions": regressions,
+            "baseline": baseline, "candidate": candidate, "median_change": changes,
             "min_median_max": {"baseline": baseline_spread, "candidate": candidate_spread}}
 
 
@@ -149,6 +225,8 @@ def main():
     parser.add_argument("--min-tps", type=float, required=True)
     parser.add_argument("--max-loss-rate", type=float, required=True)
     parser.add_argument("--metric-max", action="append", default=[], metavar="NAME=VALUE")
+    parser.add_argument("--policy", type=Path,
+                        help="JSON validation plan; required for accept_candidate, not for reporting violations")
     parser.add_argument("--load-generator-cpu-max", type=float,
                         help="Saturation threshold in the same units as load_generator_cpu_pct")
     args = parser.parse_args()
@@ -160,8 +238,9 @@ def main():
             raise ValueError("invalid threshold")
         if args.load_generator_cpu_max is not None and not measurement(args.load_generator_cpu_max):
             raise ValueError("invalid load generator CPU threshold")
+        policy = json.loads(args.policy.read_text(encoding="utf-8")) if args.policy else None
         result = compare(read(args.baseline), read(args.candidate), limits, resource_limits,
-                         args.load_generator_cpu_max)
+                         args.load_generator_cpu_max, validation_policy=policy)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         parser.error(str(exc))

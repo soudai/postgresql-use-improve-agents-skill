@@ -29,7 +29,7 @@
    ```
 
    `pending_restart = true`は再起動まで反映されていない。設定ファイルの誤りがあるとreloadでその値が無視される。
-5. 同じ負荷条件で比較する。
+5. 代表性、試行数、観測時間、必要な件数、許容するばらつきを変更前に決め、同じ負荷条件で複数回比較する。数値の推奨を採用しただけでは改善の確認にならない。
 
 ## 確認する指標
 
@@ -37,11 +37,17 @@
 | --- | --- | --- |
 | shared_buffers | 読み取りI/O、`IO:DataFileRead`の割合、応答時間 | OSのメモリ・swap、checkpointの書き込み量 |
 | work_mem等 | temp量、対象SQLの時間 | プロセスのRSS、OOM、swap |
-| max_wal_size／checkpoint | `num_requested`の比率、WAL量、FPI、書き込みI/O | pg_walの使用量、復旧時間の見積もり |
+| max_wal_size／checkpoint | 原因ログと照合したcheckpoint、WAL量、FPI、書き込みI/O | pg_walの使用量・保持要因、復旧時間の見積もり |
 | random_page_cost等 | 代表SQLの計画と時間 | 他SQLの計画退行（`pg_stat_statements`の区間比較） |
 | autovacuum | dead tuple、autovacuum backlog、vacuum所要時間 | I/O遅延、応答時間 |
-| jit | JIT時間、対象SQLの時間 | 長い分析SQLの時間 |
+| jit | 同条件のON/OFFでコンパイルを含む総実行時間、試行間のばらつき | 長い分析SQLの時間、計画・cache・同時負荷の差 |
 | ログ設定 | 必要なイベントが記録される | ログ量、ディスク、ログ収集の遅延 |
+
+num_requestedには手動要求も含まれるため、比率が減ったことだけではWAL設定の効果を断定しない。max_wal_sizeはディスク使用量の上限でもない。[checkpoint統計](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-CHECKPOINTER-VIEW)、[WAL設定](https://www.postgresql.org/docs/18/runtime-config-wal.html#GUC-MAX-WAL-SIZE)
+
+JITの生成時間にはdeform時間が含まれる。二重計上を避け、JIT比率の減少と処理全体の短縮を区別する。[JITの判断と総実行時間の例](https://www.postgresql.org/docs/18/jit-decision.html)
+
+`postgres-workload-validation`の比較を使う場合は、合意した検証計画を`--policy`へ渡す。結果一致、観測SLO、証拠の充足を個別に読み、既知の違反を他の欠測で打ち消さない。中央値の差やSLO合格だけで変更の因果的な改善を証明したとは表現しない。
 
 ## 切り戻し
 
