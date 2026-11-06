@@ -1,225 +1,142 @@
-# PostgreSQL Performance Diagnostics Agent Skill
+# PostgreSQL Diagnostics and Review Skills
 
-PostgreSQL 18・19の統計情報、実行計画、ログを使い、改善するSQLやテーブルを根拠付きで絞り込むAgent Skillです。[全体計画Issue #1](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/1)の診断を、共通の収集基盤と用途別の手順にまとめています。
+[English](README.md) | [日本語](README_ja.md)
 
-## 内容
+Five agent skills for investigating PostgreSQL performance, reviewing configuration, schema design and security, and validating changes under a representative workload. Each skill turns observations into findings, missing evidence, proposed changes, and verification steps.
 
-- `skills/postgres-performance-diagnostics/SKILL.md`: エージェントの入口と調査の分岐。
-- `references/`: 待機イベント、SQL・索引、I/O・メモリ、ロック、保守・レプリケーションの診断手順。
-- `sql/`: 読み取り用の収集SQLと、その依存ビューを記録するマニフェスト。
-- `scripts/`: スナップショット収集、待機サンプリング、区間差分、変更前後の比較、実行計画、JSONログ、アプリtraceの解析。
-- `skills/postgres-config-tuning/`: 設定（postgresql.conf・ロール単位・parameter group）の見直しと変更計画を作る別スキル。
-- `skills/postgres-security-review/`: ロール・RLS・認証・実行環境・更新状況をアクセス契約と照合し、改善と復旧を検証する別スキル。
+Start with the [English examples](example/en/README.md) or [日本語の利用例](example/ja/README.md). Skill instructions and detailed reference documents are currently primarily in Japanese; the use-case examples are available in both languages.
 
-統計から出せるのは調査候補です。Seq Scan、低ヒット率、高い実行回数だけで異常とは判定せず、実行計画やアプリの情報で原因を確認します。DDL・設定変更・セッション終了を自動適用するツールではありません。
+## Choose a skill
 
-## 利用要件と対応版
+| Task | Skill | Main inputs |
+| --- | --- | --- |
+| Slow SQL, waits, I/O, locks, vacuum, WAL or replication | [postgres-performance-diagnostics](skills/postgres-performance-diagnostics/SKILL.md) | Two statistics snapshots, wait samples, plans, logs or application traces |
+| Memory, connections, checkpoints, autovacuum, planner or JIT settings | [postgres-config-tuning](skills/postgres-config-tuning/SKILL.md) | Current settings, available resources, workload and interval report |
+| Missing constraints, naming, lifecycle, responsibilities or contention-prone tables | [postgres-schema-review](skills/postgres-schema-review/SKILL.md) | Catalog snapshot, business contract and operational evidence |
+| Roles, RLS, authentication, TLS, runtime privileges or security updates | [postgres-security-review](skills/postgres-security-review/SKILL.md) | Catalog snapshot, access contract and evidence for each connection route |
+| Correctness, latency, throughput and resource use before and after a change | [postgres-workload-validation](skills/postgres-workload-validation/SKILL.md) | Repeated run logs, matching conditions, SLOs and a validation policy |
 
-- Python 3.10以降。解析スクリプトは標準ライブラリで動作します。
-- 実DBからの収集には`psql`と接続情報が必要です。PostgreSQL 18以降のクライアントを推奨します。
-- 基本統計は標準機能を使用し、SQL単位の累積統計には`pg_stat_statements`を使用します。未導入・権限不足の収集項目は、その制限を報告します。
-- 対象はPostgreSQL 18・19です。2026-10-26に確認した[公式19ドキュメント](https://www.postgresql.org/docs/19/index.html)はRC1です。実サーバの版、ビュー・列、拡張版を検出し、19正式版公開後にも検証してください。
+Use the skills together when needed: diagnose a symptom, prepare a scoped change, then validate it. A schema or security review can also start independently from an existing snapshot.
 
-## スキルを利用する
+## Try an offline example
 
-利用するエージェントのスキル探索ディレクトリへ、`skills/postgres-performance-diagnostics`をフォルダごと配置します。配置先はエージェントごとに確認してください。以下はCodex用のコピー例です。既存の同名スキルがある場合は、上書きせず差分を確認してください。
-
-```powershell
-$skillSource = Join-Path (Get-Location) 'skills/postgres-performance-diagnostics'
-$skillTarget = Join-Path $env:USERPROFILE '.codex/skills/postgres-performance-diagnostics'
-if (Test-Path -LiteralPath $skillTarget) { throw '同名スキルが既にあります。差分を確認してください。' }
-New-Item -ItemType Directory -Path (Split-Path $skillTarget -Parent) -Force | Out-Null
-Copy-Item -LiteralPath $skillSource -Destination $skillTarget -Recurse
-```
-
-呼び出し例:
+Python 3.10 or later is sufficient for this example. Use `python3` in place of `python` if that is your interpreter's command name. From the repository root, run:
 
 ```text
-$postgres-performance-diagnostics を使い、before.json と after.json から
-改善候補を抽出してください。対象APIのp95目標は200msです。
-実行計画が不足する候補は、必要な追加情報と取得手順を示してください。
+python skills/postgres-workload-validation/scripts/compare_runs.py example/inputs/workload/baseline.json example/inputs/workload/candidate.json --p95-ms 20 --min-tps 4 --max-loss-rate 0 --metric-max oom_kills=0
 ```
 
-## 統計を収集・比較する
+The JSON result includes `"decision": "rollback_candidate"`: the candidate returns a different result, even though its synthetic latency values are lower. Missing resource metrics and insufficient trials remain visible in the report. The command analyzes local files and does not connect to PostgreSQL or perform a rollback.
 
-接続先は`PGSERVICE`または`PGHOST`・`PGPORT`・`PGDATABASE`・`PGUSER`等、認証はlibpqのパスワードファイルなどで設定します。パスワードをコマンドラインやリポジトリへ記載しないでください。
+These tiny fixtures demonstrate the decision logic; they are not benchmark measurements or sufficient evidence of performance. See the [complete prompt and result](example/en/07-workload-validation.md).
 
-```powershell
-$env:PGSERVICE = 'performance-observer'
+## Use a skill with your agent
+
+Copy the complete folder for each skill you need from `skills/` into your agent's configured skill discovery directory. Keep its `SKILL.md`, `scripts/`, `sql/`, `references/` and `assets/` together where present. Check existing installations before replacing them. The discovery path and invocation syntax depend on your agent.
+
+The examples use `$skill-name` invocation. For an agent that accepts it:
+
+```text
+Use $postgres-performance-diagnostics to review before.json and after.json.
+The affected API has a p95 target of 200 ms. Rank candidates by user impact,
+separate observations from hypotheses, and explain which additional evidence
+is needed before proposing a change. Include verification and rollback steps.
+```
+
+`before.json` and `after.json` in this prompt are files you supply. Except for the workload fixtures above, the example filenames describe inputs to prepare; they are not bundled datasets.
+
+## Examples by use case
+
+Each page contains context, a copyable prompt, an example report and the next verification steps. Cases 01–06 use fictional observations and illustrative agent reports, rather than exact CLI output.
+
+| Use case | English | Japanese |
+| --- | --- | --- |
+| Slow query, row estimates and index hypotheses | [01](example/en/01-slow-query.md) | [01](example/ja/01-slow-query.md) |
+| Blocking chains and incomplete activity visibility | [02](example/en/02-lock-contention.md) | [02](example/ja/02-lock-contention.md) |
+| Checkpoints, JIT and scoped configuration trials | [03](example/en/03-configuration-review.md) | [03](example/ja/03-configuration-review.md) |
+| Constraints, naming and table lifecycle | [04](example/en/04-schema-review.md) | [04](example/ja/04-schema-review.md) |
+| Least privilege, RLS, passwords and TLS | [05](example/en/05-security-review.md) | [05](example/ja/05-security-review.md) |
+| Security update evidence and upgrade readiness | [06](example/en/06-upgrade-readiness.md) | [06](example/ja/06-upgrade-readiness.md) |
+| Correctness regression despite lower latency | [07](example/en/07-workload-validation.md) | [07](example/ja/07-workload-validation.md) |
+
+## Collect and analyze your own evidence
+
+The following commands run from the repository root. Offline analyzers use Python 3.10+ and the standard library. Collecting from a live database additionally requires a compatible `psql` client and access to the target. SQL-level cumulative statistics use `pg_stat_statements` when available; unavailable sections are reported as limitations.
+
+Configure the connection with libpq settings such as `PGSERVICE` and an existing password file. Use a stable, nonsecret instance label. For the performance collector:
+
+```text
 python skills/postgres-performance-diagnostics/scripts/collect.py --instance-id prod-primary --output snapshots/before.json
 ```
 
-代表的な負荷が流れた後、同じ接続先・同じ識別子で再度収集します。
+After a representative workload interval, collect from the same target and analyze the difference:
 
-```powershell
+```text
 python skills/postgres-performance-diagnostics/scripts/collect.py --instance-id prod-primary --output snapshots/after.json
-python skills/postgres-performance-diagnostics/scripts/analyze.py snapshots/before.json snapshots/after.json --format markdown --output reports/interval.md --top 20
+python skills/postgres-performance-diagnostics/scripts/analyze.py snapshots/before.json snapshots/after.json --format json --output reports/interval.json --top 20
 ```
 
-`--instance-id`は接続先を識別する安定した名前にし、別クラスタに同じ名前を使わないでください。統計のreset、再起動、ロール切替、設定変更があった区間は、その影響を確認して新たな基準点を取得します。
+Restart, statistics reset, failover, role changes and workload changes can invalidate a comparison. Use fresh comparable snapshots when needed. For collection permissions, limits, wait sampling, plans and logs, see the [collection guide](skills/postgres-performance-diagnostics/references/collection.md) and [diagnostic workflow](skills/postgres-performance-diagnostics/SKILL.md).
 
-SQL本文は収集時の`--include-query-text`指定時だけ含めます。本文を含めない場合も、relation名、ユーザー名、application_name等は機密情報になり得ます。出力は権限を限定した場所に保存してください。`snapshots/`と`reports/`はGitの対象外です。
+To review configuration, collect settings using the application's connection role and database. Replace these example resource values with measured values for your environment:
 
-区間レポートには、top-level実行時間に占める割合（`exec_time_share`）、論理読み取り・WAL量・計画時間の順位、DB単位の平均アクティブセッション数に加え、時点の候補として`xmin_horizon_holders`（VACUUMの回収を止めている保持元）、`redundant_indexes`（重複・先頭一致の索引）、`autovacuum_backlog`（起動閾値を超えたテーブル）が含まれます。
-
-## 待機をサンプリングする
-
-累積統計では、時間がCPU・I/O・ロックのどこで使われたかは分かりません。症状が出ている間に`pg_stat_activity`をサンプリングし、待機の内訳とquery_idごとの割合を集計します。
-
-```powershell
-python skills/postgres-performance-diagnostics/scripts/sample_activity.py --instance-id prod-primary --samples 120 --interval 1 --format markdown --output reports/waits.md
+```text
+psql -X -qAt --set=instance_id=prod-primary --file skills/postgres-config-tuning/sql/settings.sql > snapshots/settings.json
+python skills/postgres-config-tuning/scripts/review_config.py snapshots/settings.json --ram-gb 64 --cpus 16 --storage ssd --workload oltp --max-active-connections 80 --interval-report reports/interval.json --output reports/config.md
 ```
 
-1つの接続で読み取りSELECTと`pg_sleep`を交互に実行します。SQL本文は取得しません。解釈は[待機イベント](skills/postgres-performance-diagnostics/references/wait-events.md)を参照してください。
+Omit unknown resource inputs; use `--managed` for a managed service. The JSON interval report above provides observations for the review. See [apply, verify and roll back](skills/postgres-config-tuning/references/apply-and-verify.md) for change planning.
 
-取得項目、拡張導入、権限、タイムアウト、収集上限については[収集手順](skills/postgres-performance-diagnostics/references/collection.md)を参照してください。スクリプトの正確な引数は各`--help`でも確認できます。
+Other inputs and workflows:
 
-## 計画とログを解析する
-
-```powershell
-python skills/postgres-performance-diagnostics/scripts/analyze_plan.py plan.json --format json --output reports/plan.json
-python skills/postgres-performance-diagnostics/scripts/analyze_logs.py postgresql.jsonlog --format json --output reports/logs.json
-```
-
-`plan.json`はJSON形式のEXPLAIN出力です。ログ解析はPostgreSQLの`jsonlog`を対象とします。`--format`の既定はMarkdownです。式やSQL・ログ本文まで出力する場合は`--include-details`を指定します。EXPLAIN ANALYZEはSQLを実際に実行するため、まず取得済みの計画を使い、追加実行が必要なときは対象・負荷・副作用を評価します。詳しくは[クエリ診断](skills/postgres-performance-diagnostics/references/query-tuning.md)を参照してください。
-
-自動解析は候補抽出を補助します。計画解析は全ての最適化を網羅せず、ログのtemp・duration等のメッセージ解析は英語形式を対象とします。deadlockはSQLSTATEでも判別します。未分類ログや部分採取がある場合は、解析結果の制限事項を確認してください。
-
-## 設定を最適化する
-
-`skills/postgres-config-tuning`は、ハードウェア・ワークロード・観測結果から設定の変更案を作る別スキルです。診断スキルと同様にフォルダごと配置します。現在の設定は`pg_settings`全体を、資格情報・コマンド・パスを伏せてJSONで取得します。
-
-```powershell
-psql -X -qAt --file skills/postgres-config-tuning/sql/settings.sql > settings.json
-python skills/postgres-config-tuning/scripts/review_config.py settings.json --ram-gb 64 --cpus 16 --storage ssd --workload oltp --max-active-connections 80 --interval-report reports/interval.json --output reports/config.md
-```
-
-`--interval-report`には診断スキルの`analyze.py --format json`の出力を渡し、checkpointの要求比率、WAL量、temp量、JIT時間を根拠にします。メモリ・CPU・ストレージを指定しない項目は推測せず「評価対象外」として出力します。managed serviceでは`--managed`を指定します。設定は変更せず、反映方法・検証・切り戻しは[適用と検証](skills/postgres-config-tuning/references/apply-and-verify.md)にまとめています。
-
-## 診断とIssueの対応
-
-| Issue | 診断 |
+| Workflow | Preparation |
 | --- | --- |
-| [#2](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/2) | 共通収集・拡張導入・版の差分 |
-| [#3](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/3) | スロークエリ・非効率なスキャン |
-| [#4](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/4) | キャッシュ・ブロックヒット率・I/O |
-| [#5](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/5) | temp spill・ソート・ハッシュ |
-| [#6](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/6) | JOIN・ORDER BY・LIMITと索引 |
-| [#7](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/7) | 大量行取得・高頻度SQL・N+1 |
-| [#8](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/8) | ロングトランザクション・ロック・deadlock |
-| [#9](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/9) | 見積もり誤差・統計不足・計画退行 |
-| [#10](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/10) | autovacuum・肥大化・freeze・HOT |
-| [#11](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/11) | WAL・checkpoint・レプリケーション |
-| [#12](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/12) | 接続・CPU・メモリ・並列実行 |
+| Schema review | Follow [collection and input formats](skills/postgres-schema-review/references/evidence.md); adapt the [contract](skills/postgres-schema-review/assets/contract.example.json) and [evidence](skills/postgres-schema-review/assets/evidence.example.json) examples to your business rules. |
+| Security review | Follow [collection and access contracts](skills/postgres-security-review/references/evidence.md); collect separately for each database and identify missing routes, runtime facts and vendor update evidence. |
+| Workload validation | Follow [replay and comparison](skills/postgres-workload-validation/references/replay.md); define representative conditions and an evidence policy before collecting repeated runs. |
 
-## 検証
+Each script exposes `--help`. Filenames in commands other than the bundled offline example are outputs to collect or inputs you provide. Security collectors require the output parent directories to exist and refuse to overwrite existing files.
 
-```powershell
+## Interpret the report
+
+- Missing, stale, truncated or inaccessible evidence is reported as unknown or limited. It is not equivalent to zero load, no finding or a pass.
+- A sequential scan, nullable column, Boolean flag or mutable table needs context. A finding should connect an observed structure to a business invariant or measured behavior.
+- Requested checkpoints alone do not establish WAL pressure. JIT compilation share alone does not justify disabling JIT.
+- RLS flags, SCRAM verifier format and file modes alone do not prove effective isolation, password strength or authorized access.
+- Workload report v2 separates correctness, performance, evidence quality and improvement. `accept_candidate` requires an explicit `--policy` and its evidence conditions; meeting SLOs alone does not establish a causal improvement.
+
+The collectors primarily read catalogs and statistics. Plans using `EXPLAIN ANALYZE` execute the target SQL, and workload replay can write data. Apply DDL, configuration changes, restarts, session termination or replay only within the authorized scope, with concrete verification and recovery steps.
+
+Avoid putting credentials in commands, prompts or tracked files. Identifiers, SQL, plans and logs can also contain sensitive information; limit collection and sharing to what the task requires. `snapshots/` and `reports/` are ignored by Git, but that does not restrict filesystem access.
+
+## Compatibility and validation
+
+Performance diagnostics, configuration tuning and schema review target PostgreSQL 18 and 19. Recorded integration runs include PostgreSQL 18.6 and 19 RC1; this is a tested-build record, not a statement about the latest release. Validate the exact server, extensions and managed-service behavior you use. The security collector supports version-dependent catalog collection on PostgreSQL 14+ and attempts identity/version collection on older releases; this does not imply complete coverage of every version.
+
+Activity samples and schema snapshots use schema version 2. Legacy inputs may lack evidence needed for a complete assessment. See [wait-event interpretation](skills/postgres-performance-diagnostics/references/wait-events.md), [schema input compatibility](skills/postgres-schema-review/references/evidence.md) and [workload report fields](skills/postgres-workload-validation/references/replay.md).
+
+Run the unit tests from the repository root:
+
+```text
 python -m unittest discover -s tests -v
 ```
 
-ユニットテストには本番DBの認証情報は不要です。実サーバでの検証では、PostgreSQLと拡張の正確な版、成功した収集項目、スキップした項目を記録してください。性能改善の評価手順と、診断レポートの形式は[検証手順](skills/postgres-performance-diagnostics/references/validation.md)にあります。
-
-Dockerによる統合テストは、使用する公式イメージをローカルに取得してから実行します。
-
-```powershell
-docker pull postgres:18-bookworm
-python tests/integration.py --image postgres:18-bookworm
-docker pull postgres:19rc1-bookworm
-python tests/integration.py --image postgres:19rc1-bookworm
-```
-
-各Issueの問題例・正常例・情報不足例と変更前後の比較は、シナリオテストで再現します。CPUを2個に制限した使い捨てコンテナと、OOM確認用にメモリを640MBに制限したコンテナを使い、10分程度かかります。
-
-```powershell
-python tests/scenarios.py --image postgres:18-bookworm --report reports/scenarios-18.json
-python tests/scenarios.py --image postgres:19rc1-bookworm --only 3 9 --report reports/scenarios-19.json
-```
-
-`--only`で対象のIssue番号を絞れます。結果のJSONには、各確認項目の成否と、変更前後の計測値（実行時間、WAL量、HOT率等）が残ります。
-
-実ストレージのI/O待ち（#4・#12）を含めるには、Dockerホストで使い捨てPostgreSQLボリュームを支えるブロックデバイスを`--io-device`に指定します。cgroup v2のI/O制御が必要です。以下の`/dev/sda`は例です。
+For integration testing, Docker and the selected official image must already be available locally:
 
 ```text
-docker run --pull=never --rm --network none --entrypoint findmnt postgres:18-bookworm -n -o SOURCE -T /var/lib/postgresql
-python tests/scenarios.py --image postgres:18-bookworm --only 4 9 12 --io-device /dev/sda --report reports/scenarios-18.json
+python tests/integration.py --image postgres:18-bookworm
 ```
 
-OOM検証にはcgroup v2のメモリイベントも必要です。I/O検証はテストコンテナだけに読み取り帯域制限を設定し、実際に`PGDATA`のデバイスに適用されたことを確認します。`--io-device`の指定がない場合は、I/O待ちの実ストレージ検証をスキップしたことをJSONに記録します。
+The integration runner uses disposable containers with synthetic data, no network, no published host ports and no host data mounts. It does not pull images automatically. Detailed scenarios, prerequisites and recorded results are in [performance validation](skills/postgres-performance-diagnostics/references/validation.md), [security validation](skills/postgres-security-review/references/validation.md) and [schema refactoring validation](skills/postgres-schema-review/references/refactoring.md).
 
-テストは新しい使い捨てコンテナを作り、合成データと`pg_stat_statements`を使います。ホストのポート・データディレクトリは公開／マウントせず、コンテナのネットワークを無効化します。テスト自身が作ったコンテナだけを識別して終了時に削除します。スクリプトはイメージを自動取得しません。
+## Repository layout
 
-PostgreSQL 18.6／19 RC1で実行した統合テストとシナリオの結果は[検証記録](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。
-
-## 代表負荷で変更を検証する
-
-[postgres-workload-validation](skills/postgres-workload-validation/SKILL.md)を使って、業務負荷を再生する条件とSLOを揃えます。pgbenchの個別ログやアプリの観測イベントを使い、複数試行の応答時間・処理量・失敗・未送信・結果の一致を比較します。
-
-追加診断の実DB検証は`python tests/followups.py --image postgres:18-bookworm`または`--image postgres:19rc1-bookworm`で実行できます。ローカルのイメージから使い捨てのDBを起動します。
-
-## PostgreSQLのセキュリティをレビューする
-
-[postgres-security-review](skills/postgres-security-review/SKILL.md)は、DBの権限・RLS・認証と、実行環境・パッチ状況を根拠付きでレビューします。DBの読み取り情報と、実アプリが許可される操作や接続経路の契約を照合し、確認できた問題と追加調査が必要な項目を分けます。
-
-```sh
-mkdir -p snapshots reports
-PGSERVICE=security-observer python skills/postgres-security-review/scripts/collect.py --target node-a --database app --output snapshots/app-security.json
-python skills/postgres-security-review/scripts/advisories.py --output snapshots/upstream.json
-python skills/postgres-security-review/scripts/review.py snapshots/app-security.json --contract app-contract.json --advisories snapshots/upstream.json --output reports/app-security.md
+```text
+skills/                  Five self-contained skills, scripts and references
+example/en/              English prompts and example reports
+example/ja/              Japanese prompts and example reports
+example/inputs/workload/ Runnable synthetic comparison inputs
+tests/                   Unit tests and isolated PostgreSQL scenarios
+README.md                English guide
+README_ja.md             Japanese guide
 ```
-
-契約例、限定した管理者収集、前回比較、公開用Issue案は[収集と入力](skills/postgres-security-review/references/evidence.md)を参照してください。改善案には変更後の許可・拒否の確認と復旧手順を含めます。[検証手順と範囲](skills/postgres-security-review/references/validation.md)には隔離環境でのTLS、権限、バックアップ復元と更新の試験を記載しています。
-
-
-## セキュリティ監査の反例に対する検証
-
-RLSは子テーブルへの直接アクセスも実効ロールと操作ごとに調べ、restrictive policy等の任意の条件式から隔離の保証を断定しません。TLS鍵はmode・所有者だけで合格にせず、サービスの実効読取可否と非承認主体のアクセス確認が必要です。`review.py --as-of`はタイムゾーン付き日時を受け付け、未指定では現在UTC時刻を使います。日付だけを渡した場合、同日中のパスワード失効はunknownです。
-
-```sh
-python tests/security_regressions.py --image postgres:18-bookworm
-python tests/security_regressions.py --image postgres:19rc1-bookworm
-```
-
-試験はネットワークを分離した使い捨てDBで、子のRLSによる許可・拒否、TLS鍵の実効アクセス、失効した資格情報の新規接続拒否を確認します。詳細は[検証手順](skills/postgres-security-review/references/validation.md)を参照してください。
-
-## テーブル設計をレビューする
-
-[postgres-schema-review](skills/postgres-schema-review/SKILL.md)は、FKの不足、命名、NULL・flagの意味、ライフサイクル・責務の混在、不変にすべき事実の更新、同一行への更新競合を診断します。対象schemaのcatalogと、業務の設計契約・読み書きの観測を照合し、確定した不一致・改善候補・追加調査・根拠付き例外を区別します。Issue [#33](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/33)〜[#37](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/37)に対応します。
-
-```powershell
-python skills/postgres-schema-review/scripts/collect.py --schema public --output snapshots/schema.json
-python skills/postgres-schema-review/scripts/review.py snapshots/schema.json --contract contract.json --evidence evidence.json --format markdown --output reports/schema.md
-```
-
-[設計契約の例](skills/postgres-schema-review/assets/contract.example.json)と[観測情報の例](skills/postgres-schema-review/assets/evidence.example.json)を、実際の業務資料・コード・traceに合わせて用意します。入力形式、収集範囲と証拠の作り方は[入力手順](skills/postgres-schema-review/references/evidence.md)を参照してください。JSON形式のレポートも出力できます。
-
-collectorはPython標準ライブラリとpsqlで単独利用でき、DDLや行データを自動操作しません。設計意図とtraceの正規化には業務知識が必要です。観測していない処理、収集上限、権限による統計欠測をレポートに残します。現在状態の表、nullable FK、独立したBooleanの存在だけでは違反としません。
-
-```powershell
-python tests/schema_scenarios.py --image postgres:18-bookworm
-python tests/schema_scenarios.py --image postgres:19rc1-bookworm
-```
-
-検証した範囲と移行時の確認は[変更計画と検証](skills/postgres-schema-review/references/refactoring.md)を参照してください。
-
-
-## 証拠を限定した診断と互換性
-
-不明な情報を0や合格として扱わず、観測した事実と原因の仮説を分けて報告します。
-
-- activity sampleは出力v2です。権限やactivity追跡の不足があるとAAS・peakはnullとなり、観測できた下限と不足理由を別に出します。旧sampleを再集計する場合も追跡状態の証拠がなければ不明になります。
-- 計画の`$n`だけではgeneric planと断定しません。`--plan-mode`と`--plan-source`で採取時の根拠を記録します。BRINのlossy bitmapは本来の性質であり、メモリ不足の証拠とは限りません。`--relation-evidence`で同じ対象の索引方式を補えます。
-- 設定のcheckpoint要求比率は原因の追加調査、JIT比率は同条件ON/OFF試験の候補です。単独の比率から変更値や効果を断定しません。
-- schema snapshot v2は列とdomainのNOT NULL、制約の検証・強制状態を区別します。v1も読めますが、合成された`not_null: true`を列の保証として使わず、再収集を求めます。設計契約・観測情報の形式はv1のままです。
-- workload report v2は正しさ、観測したSLO、証拠の十分性を分けます。旧入力も読めますが、採用候補には`--policy`で代表負荷と試行数・件数・時間・ばらつきの検証計画が必要です。欠測があっても確認できた違反は残し、中央値の差だけでは因果的な改善を断定しません。
-
-監査の反例を再現する追加試験（ローカルの使い捨てDBのみ）:
-
-```sh
-python tests/performance_evidence_scenarios.py --images postgres:18-bookworm
-python tests/performance_evidence_scenarios.py --images postgres:19rc1-bookworm
-python tests/config_workload_evidence_scenarios.py --image postgres:18-bookworm
-python tests/config_workload_evidence_scenarios.py --image postgres:19rc1-bookworm
-```
-
-schemaの反例は`tests/schema_scenarios.py`に含みます。短い負荷試験は診断とログ解析の動作確認であり、本番の性能改善や採用の根拠ではありません。

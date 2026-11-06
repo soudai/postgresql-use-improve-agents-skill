@@ -1,0 +1,39 @@
+{
+  "conditions": {
+    "data": "orders-functional-v1",
+    "mix": "read-order-summary",
+    "clients": 1,
+    "cache": "synthetic",
+    "server": "synthetic-no-database"
+  },
+  "runs": [
+    {
+      "started_at": "2026-11-06T01:01:00+00:00",
+      "elapsed_seconds": 1,
+      "complete": true,
+      "result_digest": "orders=4;total=99",
+      "events": [
+        {
+          "status": "ok",
+          "latency_ms": 6
+        },
+        {
+          "status": "ok",
+          "latency_ms": 7
+        },
+        {
+          "status": "ok",
+          "latency_ms": 8
+        },
+        {
+          "status": "ok",
+          "latency_ms": 9
+        }
+      ],
+      "metrics": {
+        "cpu_pct": 15,
+        "io_read_bytes": 0
+      }
+    }
+  ]
+}
