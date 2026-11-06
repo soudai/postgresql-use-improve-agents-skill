@@ -155,3 +155,16 @@ PostgreSQL 18.6／19 RC1で実行した統合テストとシナリオの結果�
 [postgres-workload-validation](skills/postgres-workload-validation/SKILL.md)を使って、業務負荷を再生する条件とSLOを揃えます。pgbenchの個別ログやアプリの観測イベントを使い、複数試行の応答時間・処理量・失敗・未送信・結果の一致を比較します。
 
 追加診断の実DB検証は`python tests/followups.py --image postgres:18-bookworm`または`--image postgres:19rc1-bookworm`で実行できます。ローカルのイメージから使い捨てのDBを起動します。
+
+## PostgreSQLのセキュリティをレビューする
+
+[postgres-security-review](skills/postgres-security-review/SKILL.md)は、DBの権限・RLS・認証と、実行環境・パッチ状況を根拠付きでレビューします。DBの読み取り情報と、実アプリが許可される操作や接続経路の契約を照合し、確認できた問題と追加調査が必要な項目を分けます。
+
+```sh
+mkdir -p snapshots reports
+PGSERVICE=security-observer python skills/postgres-security-review/scripts/collect.py --target node-a --database app --output snapshots/app-security.json
+python skills/postgres-security-review/scripts/advisories.py --output snapshots/upstream.json
+python skills/postgres-security-review/scripts/review.py snapshots/app-security.json --contract app-contract.json --advisories snapshots/upstream.json --output reports/app-security.md
+```
+
+契約例、限定した管理者収集、前回比較、公開用Issue案は[収集と入力](skills/postgres-security-review/references/evidence.md)を参照してください。改善案には変更後の許可・拒否の確認と復旧手順を含めます。[検証手順と範囲](skills/postgres-security-review/references/validation.md)には隔離環境でのTLS、権限、バックアップ復元と更新の試験を記載しています。

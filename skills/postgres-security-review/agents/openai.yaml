@@ -1,0 +1,4 @@
+interface:
+  display_name: "PostgreSQL Security Review"
+  short_description: "Review PostgreSQL security and validate scoped fixes"
+  default_prompt: "Use $postgres-security-review to review access, authentication, and patch evidence for the specified PostgreSQL database."
