@@ -1,0 +1,4 @@
+interface:
+  display_name: "PostgreSQLテーブル設計レビュー"
+  short_description: "制約・命名・責務・ライフサイクルと更新競合からテーブル設計の改善候補を報告する"
+  default_prompt: "$postgres-schema-review を使い、PostgreSQLのテーブル設計を業務上の意味と観測結果に照らして確認し、根拠付きのリファクタリング候補を報告してください。"

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "writes": [
+    {
+      "relation": "public.orders",
+      "operation": "UPDATE",
+      "columns": [
+        "is_paid",
+        "paid_at"
+      ],
+      "business_operation": "payment",
+      "after_finalization": false,
+      "source": "trace/payment-001",
+      "observed_at": "2026-11-06T09:00:00Z"
+    },
+    {
+      "relation": "public.orders",
+      "operation": "UPDATE",
+      "columns": [
+        "is_shipped",
+        "shipped_at"
+      ],
+      "business_operation": "shipment",
+      "after_finalization": false,
+      "source": "trace/shipment-001",
+      "observed_at": "2026-11-06T09:00:01Z"
+    },
+    {
+      "relation": "public.payment_events",
+      "operation": "UPDATE",
+      "columns": [
+        "occurred_at"
+      ],
+      "business_operation": "payment-correction",
+      "after_finalization": true,
+      "source": "trace/payment-correction-001",
+      "observed_at": "2026-11-06T09:01:00Z"
+    }
+  ],
+  "profiles": [
+    {
+      "relation": "public.orders",
+      "kind": "flag_combination",
+      "columns": [
+        "is_paid"
+      ],
+      "violations": 2,
+      "rows_checked": 100,
+      "scope": "orders accepted during test interval; paid flag versus paid_at",
+      "complete": true,
+      "source": "test/flag-invariant-001",
+      "observed_at": "2026-11-06T09:02:00Z"
+    }
+  ],
+  "contention": [
+    {
+      "relation": "public.orders",
+      "operations": [
+        "payment",
+        "shipment"
+      ],
+      "same_key": true,
+      "wait_ms": 125,
+      "blocker_chain": true,
+      "transaction_boundary": true,
+      "source": "trace/orders-blocking-001",
+      "observed_at": "2026-11-06T09:00:01Z"
+    }
+  ]
+}

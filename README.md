@@ -155,3 +155,23 @@ PostgreSQL 18.6／19 RC1で実行した統合テストとシナリオの結果�
 [postgres-workload-validation](skills/postgres-workload-validation/SKILL.md)を使って、業務負荷を再生する条件とSLOを揃えます。pgbenchの個別ログやアプリの観測イベントを使い、複数試行の応答時間・処理量・失敗・未送信・結果の一致を比較します。
 
 追加診断の実DB検証は`python tests/followups.py --image postgres:18-bookworm`または`--image postgres:19rc1-bookworm`で実行できます。ローカルのイメージから使い捨てのDBを起動します。
+
+## テーブル設計をレビューする
+
+[postgres-schema-review](skills/postgres-schema-review/SKILL.md)は、FKの不足、命名、NULL・flagの意味、ライフサイクル・責務の混在、不変にすべき事実の更新、同一行への更新競合を診断します。対象schemaのcatalogと、業務の設計契約・読み書きの観測を照合し、確定した不一致・改善候補・追加調査・根拠付き例外を区別します。Issue [#33](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/33)〜[#37](https://github.com/soudai/postgresql-use-improve-agents-skill/issues/37)に対応します。
+
+```powershell
+python skills/postgres-schema-review/scripts/collect.py --schema public --output snapshots/schema.json
+python skills/postgres-schema-review/scripts/review.py snapshots/schema.json --contract contract.json --evidence evidence.json --format markdown --output reports/schema.md
+```
+
+[設計契約の例](skills/postgres-schema-review/assets/contract.example.json)と[観測情報の例](skills/postgres-schema-review/assets/evidence.example.json)を、実際の業務資料・コード・traceに合わせて用意します。入力形式、収集範囲と証拠の作り方は[入力手順](skills/postgres-schema-review/references/evidence.md)を参照してください。JSON形式のレポートも出力できます。
+
+collectorはPython標準ライブラリとpsqlで単独利用でき、DDLや行データを自動操作しません。設計意図とtraceの正規化には業務知識が必要です。観測していない処理、収集上限、権限による統計欠測をレポートに残します。現在状態の表、nullable FK、独立したBooleanの存在だけでは違反としません。
+
+```powershell
+python tests/schema_scenarios.py --image postgres:18-bookworm
+python tests/schema_scenarios.py --image postgres:19rc1-bookworm
+```
+
+検証した範囲と移行時の確認は[変更計画と検証](skills/postgres-schema-review/references/refactoring.md)を参照してください。
