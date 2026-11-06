@@ -104,3 +104,7 @@ Amazon RDS／Aurora、Cloud SQL、Azure Database for PostgreSQL等は、パラ�
 - [Query Planning](https://www.postgresql.org/docs/18/runtime-config-query.html)
 - [Automatic Vacuuming](https://www.postgresql.org/docs/18/runtime-config-autovacuum.html)
 - [Huge Pages](https://www.postgresql.org/docs/18/kernel-resources.html#LINUX-HUGE-PAGES)
+
+## 総メモリの見積もり
+
+ホストの`--ram-gb`とcgroup／サービスの`--memory-limit-gb`の小さい方を使う。`--max-active-connections`、`--sort-nodes`、`--hash-nodes`、`--parallel-workers-per-query`、`--maintenance-jobs`に同時に重なる量を入力する。leaderとworkerに演算の予算を配り、保守メモリは同時コマンドとautovacuum workerごとに確保する。並列保守コマンドのmaintenance_work_memはコマンド全体の予算とする。20%の余力と共有領域を確保した残額から概算する。共有ハッシュ領域、バックエンドの固定費、OSキャッシュ等は実測で確認する。計画やピーク負荷の入力がない場合は、レポートの仮定と不足情報を確認する。

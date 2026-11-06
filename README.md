@@ -149,3 +149,9 @@ OOM検証にはcgroup v2のメモリイベントも必要です。I/O検証は�
 テストは新しい使い捨てコンテナを作り、合成データと`pg_stat_statements`を使います。ホストのポート・データディレクトリは公開／マウントせず、コンテナのネットワークを無効化します。テスト自身が作ったコンテナだけを識別して終了時に削除します。スクリプトはイメージを自動取得しません。
 
 PostgreSQL 18.6／19 RC1で実行した統合テストとシナリオの結果は[検証記録](skills/postgres-performance-diagnostics/references/validation.md)を参照してください。
+
+## 代表負荷で変更を検証する
+
+[postgres-workload-validation](skills/postgres-workload-validation/SKILL.md)を使って、業務負荷を再生する条件とSLOを揃えます。pgbenchの個別ログやアプリの観測イベントを使い、複数試行の応答時間・処理量・失敗・未送信・結果の一致を比較します。
+
+追加診断の実DB検証は`python tests/followups.py --image postgres:18-bookworm`または`--image postgres:19rc1-bookworm`で実行できます。ローカルのイメージから使い捨てのDBを起動します。

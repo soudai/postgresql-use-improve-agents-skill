@@ -45,7 +45,8 @@
 
 ## 切り戻し
 
-- `ALTER SYSTEM RESET name;`（または該当行を戻す）→ `SELECT pg_reload_conf();`、再起動が必要なものは再起動。
-- `ALTER ROLE app RESET name;`、`ALTER DATABASE db RESET name;`、`ALTER TABLE ... RESET (...)`。
+- 変更前に対象DB・ロール・現在値・適用元・同じ範囲の明示設定を控える。ロール・DBのエクスポートは当該アプリの新規接続で取り、保存したoverrideの範囲を確認する。設定ファイル、起動引数、managed parameter groupは各管理元の元値を保存する。
+- 明示値があった場合は同じ範囲と方法のSETで元値を戻す。明示値がなかった場合は同じ範囲をRESETする。例えばロール＋DBのwork_memを変更した場合、既存overrideは`ALTER ROLE app IN DATABASE db SET work_mem = '16MB';`で元値へ、元から継承なら`ALTER ROLE app IN DATABASE db RESET work_mem;`で継承へ戻す。
+- reload／restartや新規接続が必要な変更はそれぞれ実施し、対象セッションで値・source・pending_restartを再確認する。
 - 再起動が必要な値（shared_buffers、huge_pages等）は、起動できない設定に備えて、変更前の設定ファイルを残し、起動確認まで保守時間内で行う。`huge_pages=on`はOS側の確保不足で起動に失敗する。
 - 切り戻し条件（応答時間、エラー率、メモリ使用率の閾値）を変更前に決める。

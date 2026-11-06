@@ -16,6 +16,7 @@
   {"name":"slots","file":"slots.sql","requires":["pg_catalog.pg_replication_slots"]},
   {"name":"replication_slots","file":"replication_slots.sql","requires":["pg_catalog.pg_stat_replication_slots"]},
   {"name":"subscriptions","file":"subscriptions.sql","requires":["pg_catalog.pg_stat_subscription","pg_catalog.pg_subscription"]},
+  {"name":"subscription_relations","file":"subscription_relations.sql","requires":["pg_catalog.pg_subscription_rel"]},
   {"name":"subscription_stats","file":"subscription_stats.sql","requires":["pg_catalog.pg_stat_subscription_stats","pg_catalog.pg_subscription"]},
   {"name":"conflicts","file":"conflicts.sql","requires":["pg_catalog.pg_stat_database_conflicts"]},
   {"name":"prepared","file":"prepared.sql","requires":["pg_catalog.pg_prepared_xacts"]},

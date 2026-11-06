@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 from pathlib import Path
@@ -30,15 +31,43 @@ def ratio(a, b):
     return a / b if numeric(a) and numeric(b) and b != 0 else None
 
 
-def statements(report):
-    result = {}
+def statements(report, warnings, label):
+    result, duplicates = {}, set()
     for entry in report.get("deltas", {}).get("pgss", []):
         identity = entry.get("identity", {})
-        key = str(identity.get("queryid"))
-        if entry.get("toplevel") is False or key in result:
-            continue  # Same SQL by several users: keep the first top-level entry; see warnings.
+        queryid = identity.get("queryid")
+        if identity.get("toplevel", entry.get("toplevel")) is False:
+            continue
+        if queryid is None:
+            warnings.append(f"{label}: excluded statement with unknown query ID")
+            continue
+        dbid, userid = identity.get("dbid"), identity.get("userid")
+        key = f"{dbid}:{userid}:{queryid}" if dbid is not None and userid is not None else str(queryid)
+        if key in result:
+            duplicates.add(key)
         result[key] = entry
+    for key in sorted(duplicates):
+        del result[key]
+        warnings.append(f"{label}: duplicate SQL identity {key} excluded")
+    counts = Counter(key.split(":")[-1] for key in result)
+    for key in list(result):
+        if ":" not in key and counts[key] > 1:
+            del result[key]
+            warnings.append(f"{label}: incomplete SQL identity {key} excluded")
+    if any(":" not in key for key in result):
+        warnings.append(f"{label}: legacy SQL identity lacks DB or user")
     return result
+
+
+def resolve(selector, entries, warnings, label):
+    matches = [key for key in entries if key == selector or key.split(":")[-1] == selector]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        warnings.append(f"{label}: ambiguous query {selector}; use DBID:USERID:QUERYID")
+    else:
+        warnings.append(f"{label}: query {selector} missing")
+    return None
 
 
 def profile(entry):
@@ -79,30 +108,54 @@ def system(report):
 
 def compare(before, after, mapping=None, queryids=None):
     warnings = []
-    if before.get("instance_id") != after.get("instance_id") or before.get("database") != after.get("database"):
-        warnings.append("different instance or database: environment differences may dominate")
+    metadata_a, metadata_b = before.get("metadata", {}), after.get("metadata", {})
+    different = any(before.get(field) != after.get(field) for field in ("instance_id", "database"))
+    for field in ("server_version_num", "database_oid", "in_recovery"):
+        left, right = metadata_a.get(field), metadata_b.get(field)
+        if left is None or right is None:
+            warnings.append(f"{field}: missing metadata; environment not fully verified")
+        elif field == "server_version_num":
+            different |= left // 10000 != right // 10000
+            if left != right:
+                warnings.append(f"server version differs: {left} -> {right}")
+        else:
+            different |= left != right
+    if metadata_a.get("extensions") != metadata_b.get("extensions"):
+        warnings.append("extension versions differ or are unavailable")
+    if different:
+        warnings.append("different instance, database, role or server major; explicit SQL mapping required")
     settings_a = (before.get("settings") or {}).get("after", {})
     settings_b = (after.get("settings") or {}).get("after", {})
     changed = sorted(name for name in set(settings_a) | set(settings_b) if settings_a.get(name) != settings_b.get(name))
     if not settings_a or not settings_b:
         warnings.append("settings unavailable in one report: configuration differences not checked")
     for report, label in ((before, "baseline"), (after, "candidate")):
-        for warning in report.get("warnings", []):
-            if "suppressed" in warning or "unavailable" in warning or "truncated" in warning:
-                warnings.append(f"{label}: {warning}")
-    a, b = statements(before), statements(after)
-    pairs = dict(mapping or {})
-    if queryids:
-        pairs.update({q: pairs.get(q, q) for q in queryids})
-    else:
-        pairs.update({q: q for q in a if q in b and q not in pairs})
+        warnings.extend(f"{label}: {warning}" for warning in report.get("warnings", []))
+    a, b = statements(before, warnings, "baseline"), statements(after, warnings, "candidate")
+    pairs = {}
+    mapping = mapping or {}
+    for old, new in mapping.items():
+        left, right = resolve(old, a, warnings, "baseline"), resolve(new, b, warnings, "candidate")
+        if left is not None and right is not None:
+            pairs[left] = right
+    if not different:
+        if queryids:
+            for selector in queryids:
+                if selector in mapping:
+                    continue
+                left = resolve(selector, a, warnings, "baseline")
+                right = resolve(selector, b, warnings, "candidate")
+                if left is not None and left == right:
+                    pairs.setdefault(left, right)
+                elif left is not None and right is not None:
+                    warnings.append(f"query {selector}: SQL identities differ; explicit mapping required")
+        else:
+            pairs.update({key: key for key in a if key in b and key not in pairs and key not in pairs.values()})
     results = []
     for old, new in pairs.items():
-        if old not in a or new not in b:
-            warnings.append(f"query {old} -> {new}: missing in {'baseline' if old not in a else 'candidate'}")
-            continue
         item = compare_statement(a[old], b[new])
-        item.update(baseline_queryid=old, candidate_queryid=new)
+        item.update(baseline_queryid=old.split(":")[-1], candidate_queryid=new.split(":")[-1],
+                    baseline_identity=old, candidate_identity=new)
         results.append(item)
     results.sort(key=lambda x: -(x["before"]["total_exec_time_per_call"] or 0) * (x["before"]["calls"] or 0))
     sys_a, sys_b = system(before), system(after)
@@ -121,7 +174,7 @@ def markdown(result, top=20):
     lines += ["## Comparability", ""] + (["- " + w for w in result["warnings"]] or ["- No difference detected in recorded conditions."])
     if result["settings_changed"]:
         lines += ["", "Settings changed: " + json.dumps(result["settings_changed"], ensure_ascii=False)]
-    lines += ["", "## Statements", "", "| queryid | calls | ms/call before | ms/call after | ratio | rows/call | warnings |",
+    lines += ["", "## Statements", "", "| SQL identity | calls | ms/call before | ms/call after | ratio | rows/call | warnings |",
               "|---|---:|---:|---:|---:|---:|---|"]
 
     def cell(value):
@@ -129,16 +182,16 @@ def markdown(result, top=20):
 
     for item in result["statements"][:top]:
         a, b = item["before"], item["after"]
-        lines.append("| " + " | ".join([f"{item['baseline_queryid']}→{item['candidate_queryid']}",
+        lines.append("| " + " | ".join([f"{item['baseline_identity']}→{item['candidate_identity']}",
                                         f"{cell(a['calls'])}→{cell(b['calls'])}", cell(a["total_exec_time_per_call"]),
                                         cell(b["total_exec_time_per_call"]), cell(item["after_over_before"]["total_exec_time_per_call"]),
                                         f"{cell(a['rows_per_call'])}→{cell(b['rows_per_call'])}",
                                         "; ".join(item["warnings"]).replace("|", "\\|")]) + " |")
     lines += ["", "## Shared reads per call", "",
-              "| queryid | Bytes before | Bytes after | Read ms before | Read ms after |",
+              "| SQL identity | Bytes before | Bytes after | Read ms before | Read ms after |",
               "|---|---:|---:|---:|---:|"]
     for item in result["statements"][:top]:
-        values = [f"{item['baseline_queryid']}→{item['candidate_queryid']}"]
+        values = [f"{item['baseline_identity']}→{item['candidate_identity']}"]
         for metric in ("shared_read_bytes_per_call", "shared_blk_read_time_per_call"):
             values.extend(cell(item[period][metric]) for period in ("before", "after"))
         lines.append("| " + " | ".join(values) + " |")
@@ -152,8 +205,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path, help="analyze.py --format json report before the change")
     parser.add_argument("candidate", type=Path, help="analyze.py --format json report after the change")
-    parser.add_argument("--queryid", action="append", help="Compare only these query IDs (repeatable)")
-    parser.add_argument("--map", action="append", default=[], help="OLD=NEW query ID pairing for rewritten SQL")
+    parser.add_argument("--queryid", action="append", help="Compare SQL by QUERYID or DBID:USERID:QUERYID (repeatable)")
+    parser.add_argument("--map", action="append", default=[], help="OLD=NEW SQL identity pairing")
     parser.add_argument("--format", choices=("json", "markdown"), default="markdown")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)

@@ -63,9 +63,14 @@ def size(value: float) -> str:
     return f"{max(int(value // 1024), 1)}kB"
 
 
-def rounded(value: float) -> str:
+def rounded_bytes(value: float) -> int:
     """A conf-friendly size: whole GB from 4GB up, whole MB below."""
-    return size(round(value / GB) * GB if value >= 4 * GB else max(round(value / MB), 1) * MB)
+    unit = GB if value >= 4 * GB else MB
+    return max(round(value / unit), 1) * unit
+
+
+def rounded(value: float) -> str:
+    return size(rounded_bytes(value))
 
 
 def human(settings: dict, name: str) -> str | None:
@@ -90,7 +95,9 @@ class Review:
     def __init__(self, settings, args, evidence):
         self.s, self.args, self.ev = settings, args, evidence
         self.findings, self.not_evaluated = [], []
-        self.ram = args.ram_gb * GB if args.ram_gb else None
+        limits = [value for value in (args.ram_gb, getattr(args, "memory_limit_gb", None)) if value is not None]
+        self.ram = min(limits) * GB if limits else None
+        self.memory_budget = None
 
     def add(self, name, severity, recommended, rationale, *, caveat=None, evidence=None, scope="global"):
         if name not in self.s:
@@ -144,35 +151,79 @@ class Review:
             if share < 0.4 or share > 0.85:
                 self.add("effective_cache_size", "low", rounded(self.ram * 0.7),
                          f"Planner hint for cache available to one query is {share:.0%} of RAM; it allocates nothing.")
-        self.work_mem(sb or 0)
-        mwm = number(self.s, "maintenance_work_mem")
-        target = min(max(self.ram * 0.05, 256 * MB), 2 * GB)
-        if mwm and self.ram >= 4 * GB and mwm < target / 2:
-            workers = number(self.s, "autovacuum_max_workers") or 3
-            self.add("maintenance_work_mem", "low", rounded(target),
-                     "Faster VACUUM, CREATE INDEX and restoring; fewer index-vacuum passes on large tables.",
-                     caveat=f"With autovacuum_work_mem=-1 each of {int(workers)} autovacuum workers may use this much.")
+        self.work_mem(sb)
+        finding = next((item for item in self.findings if item["parameter"] == "shared_buffers"), None)
+        if self.memory_budget is not None and finding is not None:
+            proposed = rounded_bytes(self.ram * 0.25)
+            available = self.memory_budget["query_budget_bytes"]
+            projected = max(available + sb - proposed, 0)
+            self.memory_budget["proposed_shared_buffers_bytes"] = proposed
+            self.memory_budget["projected_query_budget_bytes"] = int(projected)
+            current_cap = self.memory_budget["estimated_work_mem_cap_bytes"]
+            projected_cap = current_cap * projected / available if current_cap and available else 0
+            if proposed > sb and (projected == 0 or
+                                  (current_cap is not None and number(self.s, "work_mem") > projected_cap)):
+                finding["recommended"] = None
+                finding["caveat"] = "The projected workload budget requires coordinated memory changes."
 
     def work_mem(self, shared_buffers):
-        wm, conns = number(self.s, "work_mem"), self.args.max_active_connections or number(self.s, "max_connections")
-        if not wm or not conns:
+        wm = number(self.s, "work_mem")
+        active = self.args.max_active_connections or number(self.s, "max_connections")
+        maintenance = number(self.s, "maintenance_work_mem")
+        vacuum = number(self.s, "autovacuum_work_mem")
+        vacuum_workers = number(self.s, "autovacuum_max_workers")
+        if shared_buffers is None or not wm or not active or maintenance is None or vacuum_workers is None:
+            self.skip("work_mem", "Need shared_buffers, work_mem, concurrency and maintenance settings")
             return
-        multiplier = number(self.s, "hash_mem_multiplier") or 2
-        # Assume two memory-hungry nodes per active query; hash nodes may use work_mem * hash_mem_multiplier.
-        cap = max(self.ram * 0.8 - shared_buffers, 0) / (conns * 2 * multiplier)
-        basis = ("--max-active-connections" if self.args.max_active_connections else
-                 "max_connections (pessimistic; pass --max-active-connections for pooled workloads)")
+        configured_workers = number(self.s, "max_parallel_workers_per_gather") or 0
+        workers = getattr(self.args, "parallel_workers_per_query", None)
+        if workers is None:
+            workers = configured_workers
+        pool = number(self.s, "max_parallel_workers")
+        parallel = active * workers
+        if pool is not None:
+            parallel = min(parallel, pool)
+        sort_nodes = getattr(self.args, "sort_nodes", 0)
+        hash_nodes = getattr(self.args, "hash_nodes", 2)
+        maintenance_jobs = getattr(self.args, "maintenance_jobs", 1)
+        if vacuum is None or vacuum < 0:
+            vacuum = maintenance
+        if raw(self.s, "autovacuum") == "off":
+            # Wraparound protection can still start workers.
+            self.skip("autovacuum memory", "Reserve configured workers even with autovacuum off")
+        overhead = self.ram * 0.2
+        reserved = overhead + shared_buffers + vacuum_workers * vacuum + maintenance_jobs * maintenance
+        weight = (active + parallel) * (sort_nodes + hash_nodes * (number(self.s, "hash_mem_multiplier") or 2))
+        available = max(self.ram - reserved, 0)
+        cap = int(available / weight) if weight else None
+        self.memory_budget = {
+            "ram_bytes": int(self.ram), "os_and_overhead_bytes": int(overhead),
+            "shared_buffers_bytes": int(shared_buffers), "maintenance_jobs": maintenance_jobs,
+            "maintenance_bytes": int(maintenance_jobs * maintenance), "autovacuum_workers": int(vacuum_workers),
+            "autovacuum_bytes": int(vacuum_workers * vacuum), "active_queries": int(active),
+            "parallel_workers_per_query_assumed": workers, "parallel_workers_budgeted": int(parallel),
+            "sort_nodes_per_process": sort_nodes, "hash_nodes_per_process": hash_nodes,
+            "query_budget_bytes": int(available), "estimated_work_mem_cap_bytes": cap,
+        }
+        if not self.args.max_active_connections:
+            self.skip("work_mem sizing", "Concurrency estimate uses max_connections; supply peak active queries")
+        explicit_shape = getattr(self.args, "plan_shape_known", False)
         temp = self.ev.get("temp_bytes_per_s")
-        if wm > cap:
-            self.add("work_mem", "high", size(max(cap // MB, 4) * MB),
-                     f"At {int(conns)} active connections ({basis}) the per-node limit can exceed available memory.",
-                     caveat="Raise work_mem per role/session for the queries that need it instead of globally.",
-                     evidence={"estimated_safe_cap": size(cap)})
-        elif temp and temp > 0 and wm < cap / 4:
-            self.add("work_mem", "medium", f"{size(min(cap, wm * 4))} for the spilling roles/queries",
-                     "Temp files were written in the interval while the memory budget has room.",
-                     caveat="Confirm the spilling SQL and plan node first; a better plan or index often removes the spill.",
-                     evidence={"temp_bytes_per_s": temp, "estimated_safe_cap": size(cap)}, scope="role/session")
+        minimum = int(float(self.s["work_mem"].get("min_val") or 64)) * 1024
+        if available <= 0 or (cap is not None and cap < minimum):
+            self.add("work_mem", "high", None,
+                     "The estimated budget cannot fit the minimum work_mem. Review reservations and concurrency.",
+                     evidence=self.memory_budget)
+        elif cap is not None and wm > cap:
+            self.add("work_mem", "high", size(cap) if explicit_shape else None,
+                     "The supplied concurrency and per-process operators can exceed the estimated budget.",
+                     evidence=self.memory_budget)
+        elif temp and cap is not None and wm < cap / 4:
+            self.add("work_mem", "medium", size(min(cap, wm * 4)) if explicit_shape else None,
+                     "Temp writes warrant checking which SQL and operator spilled before sizing work_mem.",
+                     evidence=self.memory_budget, scope="role/session")
+        if not explicit_shape:
+            self.skip("work_mem numeric recommendation", "Supply measured plan shape and peak active queries")
 
     # --- connections -------------------------------------------------------------------------
     def connections(self):
@@ -374,7 +425,27 @@ def evidence_from_report(report: dict | None) -> dict:
     return result
 
 
-def review(settings: dict, args, report=None) -> dict:
+def review(settings: dict, args, report=None, *, provenance=None) -> dict:
+    warnings = []
+    if report is not None and provenance is not None:
+        baseline = dict(report.get("metadata") or {})
+        baseline.update({key: report[key] for key in ("instance_id", "database") if key in report})
+        fields = ("instance_id", "database", "database_oid", "server_version_num", "session_role",
+                  "effective_role", "in_recovery", "postmaster_start")
+        conflicts = [key for key in fields if provenance.get(key) is not None
+                     and baseline.get(key) is not None and provenance[key] != baseline[key]]
+        unknown = [key for key in fields if provenance.get(key) is None or baseline.get(key) is None]
+        sampled = (report.get("settings") or {}).get("after", {})
+        conflicts.extend(name for name, value in sampled.items()
+                         if raw(settings, name) not in (None, "<redacted>", value))
+        if conflicts:
+            warnings.append("Interval evidence excluded: different " + ", ".join(conflicts))
+            report = None
+        elif unknown:
+            warnings.append("Interval evidence provenance unverified: " + ", ".join(unknown))
+            report = None
+    elif report is not None:
+        warnings.append("Interval evidence target metadata not supplied to review()")
     evidence = evidence_from_report(report)
     engine = Review(settings, args, evidence)
     findings = engine.run()
@@ -382,12 +453,20 @@ def review(settings: dict, args, report=None) -> dict:
     return {"schema_version": 1, "kind": "config_review",
             "inputs": {"ram_gb": args.ram_gb, "cpus": args.cpus, "storage": args.storage, "workload": args.workload,
                        "max_active_connections": args.max_active_connections, "managed": args.managed},
+            "provenance": provenance, "warnings": warnings, "memory_budget": engine.memory_budget,
             "evidence": evidence, "findings": findings, "not_evaluated": engine.not_evaluated,
             "pending_restart": pending, "limitations": LIMITATIONS}
 
 
 def markdown(result: dict) -> str:
     lines = ["# PostgreSQL configuration review", "", "Inputs: " + json.dumps(result["inputs"], ensure_ascii=False), ""]
+    lines += [f"- {warning}" for warning in result["warnings"]]
+    if result.get("scoped_overrides") is not None:
+        lines += ["", "Session role and database overrides: "
+                  + json.dumps(result["scoped_overrides"], ensure_ascii=False)]
+    if result["memory_budget"] is not None:
+        lines += ["", "## Memory budget", "", "| Input | Value |", "|---|---:|"]
+        lines += [f"| {key} | {value} |" for key, value in result["memory_budget"].items()]
     if result["pending_restart"]:
         lines += ["Already changed but waiting for restart: " + ", ".join(result["pending_restart"]), ""]
     lines += ["| Severity | Parameter | Current | Recommended | Apply | Scope | Why |", "|---|---|---|---|---|---|---|"]
@@ -410,6 +489,11 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("settings", type=Path, help="Output of sql/settings.sql, or a diagnostics collect.py snapshot")
     parser.add_argument("--ram-gb", type=float, help="Memory available to PostgreSQL on this host/instance")
+    parser.add_argument("--memory-limit-gb", type=float, help="cgroup or provider memory limit")
+    parser.add_argument("--sort-nodes", type=int, help="Peak simultaneous sort operators per process")
+    parser.add_argument("--hash-nodes", type=int, help="Peak simultaneous hash operators per process")
+    parser.add_argument("--parallel-workers-per-query", type=int)
+    parser.add_argument("--maintenance-jobs", type=int, default=1)
     parser.add_argument("--cpus", type=int, help="vCPUs available to PostgreSQL")
     parser.add_argument("--storage", choices=("ssd", "network", "hdd"))
     parser.add_argument("--workload", choices=("oltp", "olap", "mixed"), default="mixed")
@@ -419,14 +503,28 @@ def main(argv=None) -> int:
     parser.add_argument("--format", choices=("json", "markdown"), default="markdown")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
-    for name in ("ram_gb", "cpus", "max_active_connections"):
+    for name in ("ram_gb", "memory_limit_gb", "cpus", "max_active_connections"):
         value = getattr(args, name)
-        if value is not None and value <= 0:
+        if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    args.plan_shape_known = (args.sort_nodes is not None and args.hash_nodes is not None
+                             and args.parallel_workers_per_query is not None
+                             and args.max_active_connections is not None)
+    args.sort_nodes = 0 if args.sort_nodes is None else args.sort_nodes
+    args.hash_nodes = 2 if args.hash_nodes is None else args.hash_nodes
+    for name in ("sort_nodes", "hash_nodes", "parallel_workers_per_query", "maintenance_jobs"):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be nonnegative")
     try:
-        settings = load_settings(json.loads(args.settings.read_text(encoding="utf-8-sig")))
+        source = json.loads(args.settings.read_text(encoding="utf-8-sig"))
+        settings = load_settings(source)
+        provenance = dict(source.get("metadata") or {})
+        if source.get("instance_id") is not None:
+            provenance["instance_id"] = source["instance_id"]
         report = json.loads(args.interval_report.read_text(encoding="utf-8")) if args.interval_report else None
-        result = review(settings, args, report)
+        result = review(settings, args, report, provenance=provenance)
+        result["scoped_overrides"] = source.get("scoped_overrides")
         text = (json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
                 if args.format == "json" else markdown(result))
         if args.output:

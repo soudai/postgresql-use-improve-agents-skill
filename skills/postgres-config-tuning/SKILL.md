@@ -10,7 +10,7 @@ description: Review and optimize PostgreSQL 18 and 19 server configuration (post
 ## 進め方
 
 1. **前提を確認する**: PostgreSQLが使えるメモリとvCPU、ストレージ種別（ローカルSSD／ネットワーク／HDD）、自前運用かmanaged serviceか、ワークロード（OLTP／分析／混在）、pool後の同時実行数、データ量、レプリケーション構成、許容できるデータ損失と復旧時間。分からない値は推測で埋めず、その項目を評価対象外として示す。
-2. **現在の設定を取得する**: スキルフォルダから`psql -X -qAt --file sql/settings.sql > settings.json`。全`pg_settings`を、資格情報・コマンド・パスを伏せてJSONで出す。`source`で既定値か設定済みかを、`pending_restart`で再起動待ちの変更を確認する。ロール固有の`ALTER ROLE ... SET`がないロールで実行する。
+2. **現在の設定を取得する**: スキルフォルダから`psql -X -qAt --set=instance_id=prod-primary --file sql/settings.sql > settings.json`。全`pg_settings`を、資格情報・コマンド・パスを伏せてJSONで出す。`source`で既定値か設定済みかを、`pending_restart`で再起動待ちの変更を確認する。アプリと同じ接続ロール・DBで取得し、適用元とoverrideを確認する。
 3. **根拠を集める**: 設定変更の必要性は症状から判断する。`postgres-performance-diagnostics`スキルの区間レポート（`analyze.py --format json`）があれば使う。checkpointの要求比率、WAL量とFPI、temp量、JIT時間、平均アクティブセッション数を読む。
 4. **レビューする**:
 
@@ -34,3 +34,5 @@ description: Review and optimize PostgreSQL 18 and 19 server configuration (post
 ## 成果物
 
 最初に優先度の高い変更（安全性、明らかな誤設定、根拠のある性能改善）を示す。各変更に、現在値と推奨値、理由と根拠、反映に必要な操作（reload／restart）、リスク、確認する指標、切り戻し手順を添える。評価できなかった項目と、追加で必要な情報も示す。適用用のSQL・設定ファイルの差分は、レビューのための草案として示す。
+
+代表負荷の再生とSLOの判定には`postgres-workload-validation`を使う。

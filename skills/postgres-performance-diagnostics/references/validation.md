@@ -173,3 +173,18 @@ PostgreSQL 18.6（Debian 18.6-1.pgdg12+2、`pg_stat_statements` 1.12）と19 RC1
 - #12の同時実行比較では、両条件のCPU使用率・メモリ使用量を負荷中に採取し、OOM増分は両版で0だった。別の640 MB制限コンテナで、同じ集計が`work_mem=4GB`ではOOM kill 1件、`64MB`では0件で完了した。
 
 19正式版での再検証には、列と単位、待機イベント、拡張互換性の確認と上記シナリオの再実行を含める。
+
+## SQLを対応付ける
+
+同じインスタンス・DB・メジャー版内では、top-level SQLを`dbid:userid:queryid`で比較する。`--queryid`にquery IDだけを渡せるのは各レポートで一意な場合。複数ユーザーで実行したSQLは、`--queryid 16384:16500:123`のように対象を選ぶ。SQL書き換えや版・環境を跨ぐ比較では、SQLとスキーマ・代表パラメータを確認してから`--map 16384:16500:123=16384:16500:456`を使う。旧レポートは取得できた識別情報で比較し、不明な環境情報を警告する。
+
+再生条件とSLOから採用・切り戻しを判断する場合は`postgres-workload-validation`を参照する。
+
+## 実DBでの追加検証（2026-11-06）
+
+`python tests/followups.py --image postgres:18-bookworm`と`--image postgres:19rc1-bookworm`を使う。使い捨てコンテナ内で次を確認した。
+
+- ロール・DB・ロール＋DBの設定が競合する場合に、収集した値とsourceが一致し、SETとRESETで元の範囲へ復元できる。
+- FKとAFTERトリガーの時間・回数、WAL、パーティション階層とgeneric planの実行時除外を取得できる。
+- 独立したpublisherとsubscriberで初期同期、適用、意図した無効化、制約競合、decoding spillを確認した。
+- 読み取りと更新の実pgbenchログを読み、結果一致と成功・未送信を含む集計を検証できる。
