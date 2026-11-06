@@ -241,12 +241,29 @@ def rls(review, access):
                                 "finding", f"Effective role can bypass policies through {access.path(path)}.")
                 for oid in sorted(descendants):
                     child = by_oid.get(oid)
-                    if child and not child["rls"] and any(
-                        access.can(["relation", child["schema"], child["name"], ""], effective, op.upper(), True)
-                        for op in operations
+                    if child is None or not access.can(
+                        ["schema", child["schema"], child["schema"], ""], effective, "USAGE"
                     ):
-                        rls_finding(review, "RLS_PATH", [*key, name, child["schema"], child["name"]],
-                                    "finding", "Direct partition access is granted without a child RLS policy.")
+                        continue
+                    for op in operations:
+                        if not access.can(["relation", child["schema"], child["name"], ""],
+                                          effective, op.upper(), True):
+                            continue
+                        subject = [*key, name, child["schema"], child["name"], access.name(effective), op]
+                        if not child["rls"]:
+                            rls_finding(review, "RLS_PATH", subject, "finding",
+                                        "Direct child access is granted with child RLS disabled.",
+                                        source="https://www.postgresql.org/docs/current/ddl-inherit.html")
+                        elif bypasses(access, effective, child):
+                            rls_finding(review, "RLS_PATH", subject, "finding",
+                                        f"Direct child access bypasses child policies through {access.path(path)}.",
+                                        source="https://www.postgresql.org/docs/current/ddl-inherit.html")
+                        else:
+                            child_policies = [p for p in review.rows("policies") if p["relation"] == oid]
+                            status, evidence = policy_scope(child_policies, access.walk(effective, "inherit_option"), op)
+                            rls_finding(review, "RLS_PATH", subject, status,
+                                        "Direct child access: " + evidence,
+                                        source="https://www.postgresql.org/docs/current/ddl-inherit.html")
                 for oid in sorted(views):
                     view = by_oid.get(oid)
                     if not view:
@@ -269,28 +286,38 @@ def rls(review, access):
                         ["schema", schema, schema, ""], effective, "USAGE"
                     ):
                         rls_finding(review, "RLS_PATH", [*key, name, routine_key], "finding",
-                                    "Callable SECURITY DEFINER references this table as an RLS bypass role. Verify its filters.")
+                                    "Callable SECURITY DEFINER references this table as an RLS bypass role. Verify its filters.",
+                                    source="https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY")
             if not rel["rls"] or bypasses(access, actor, rel):
                 continue
             for op in operations:
-                applicable = [p for p in policies if p["command"] in ("*", OPS[op])
-                              and (0 in p["roles"] or set(p["roles"]) & inherited.keys())]
-                subject = [*key, name, op]
-                permissive = [p for p in applicable if p["permissive"]]
-                if not permissive:
-                    rls_finding(review, "RLS_POLICY", subject, "finding",
+                status, evidence = policy_scope(policies, inherited, op)
+                # Default deny is safe for an incidental child route, but blocks a
+                # declared operation on the protected target itself.
+                if status == "pass":
+                    rls_finding(review, "RLS_POLICY", [*key, name, op], "finding",
                                 "Default deny prevents the declared operation. This does not expose rows.", severity="medium")
-                    continue
-                unconditional = any(unfiltered(p, op) for p in permissive)
-                if unconditional and all(unfiltered(p, op) for p in applicable if not p["permissive"]):
-                    rls_finding(review, "RLS_POLICY", subject, "finding",
-                                "A permissive policy allows all rows and no applicable restrictive policy narrows it.")
-                elif any(p["session_setting"] for p in applicable):
-                    rls_finding(review, "RLS_POLICY", subject, "unknown",
-                                "Policy reads a session setting. Verify who can set tenant identity and reset pooled connections.")
                 else:
-                    rls_finding(review, "RLS_POLICY", subject, "unknown",
-                                "Policy exists. Metadata cannot prove that its predicate isolates tenants.")
+                    rls_finding(review, "RLS_POLICY", [*key, name, op], status, evidence)
+
+
+def policy_scope(policies, inherited, op):
+    applicable = [p for p in policies if p["command"] in ("*", OPS[op])
+                  and (0 in p["roles"] or set(p["roles"]) & inherited.keys())]
+    permissive = [p for p in applicable if p["permissive"]]
+    if not permissive:
+        return "pass", "No applicable permissive policy; default deny blocks this operation."
+    # Permissive policies combine with OR; restrictive policies combine with AND.
+    # Do not infer arbitrary predicates or their functions from metadata.
+    if (any(unfiltered(p, op) for p in permissive)
+            and all(unfiltered(p, op) for p in applicable if not p["permissive"])):
+        return "finding", ("An applicable permissive policy is unfiltered and no applicable restrictive policy "
+                           "narrows it. Verify the concrete statement, including SELECT policies for writes.")
+    if any(p["session_setting"] for p in applicable):
+        return "unknown", ("Policy reads a session setting. Verify who can set tenant identity and reset pooled "
+                           "connections for this relation, effective role and operation.")
+    return "unknown", ("Applicable predicates exist. Metadata cannot prove tenant isolation; run the scoped "
+                       "tenant CRUD matrix for this relation and effective role.")
 
 
 def unfiltered(policy, op):
@@ -315,13 +342,13 @@ def bypasses(access, actor, rel):
         not rel["force"] and rel["owner"] in access.walk(actor, "inherit_option"))
 
 
-def rls_finding(review, rule, subject, status, evidence, severity="high"):
+def rls_finding(review, rule, subject, status, evidence, severity="high", source=None):
     review.add(rule, subject, status, severity if status == "finding" else "unrated", evidence,
                "Only expected tenants and operations are permitted.",
                "Separate owner and runtime roles. Correct grants, policy predicates or access paths as applicable.",
                "In staging exercise A/B tenants, missing context, write checks, views, partitions and pooled reuse.",
                "Record policy, grants and owner first. Preserve containment if restoring the previous state would expose rows.",
-               confidence="candidate" if rule in {"RLS_PATH", "RLS_POLICY"} else "observed")
+               confidence="candidate" if rule in {"RLS_PATH", "RLS_POLICY"} else "observed", source=source)
 
 
 PATH_ITEM = re.compile(r'\s*(?:"((?:[^"]|"")*)"|([A-Za-z_][A-Za-z_0-9$]*))\s*(,|$)')

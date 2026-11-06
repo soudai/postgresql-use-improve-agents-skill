@@ -121,7 +121,8 @@ class TestSecurity(unittest.TestCase):
         c = contract(s)
         c["runtime"] = {**observed(s), "process_uid": 999, "entrypoint_uid": 0, "rootless": True,
                         "privileged": True, "files": [{"id": "key", "kind": "tls_key",
-                        "platform": "unix", "mode": "0640", "owner_uid": 0}]}
+                        "platform": "unix", "mode": "0640", "owner_uid": 0,
+                        "owner_gid": 999, "service_readable": True, "unauthorized_access": False}]}
         result = make_report(s, c, TODAY)
         self.assertEqual(findings(result, "RUNTIME", "postgres process")[0]["status"], "pass")
         self.assertEqual(findings(result, "RUNTIME", "privileged")[0]["status"], "finding")

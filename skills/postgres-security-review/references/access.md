@@ -11,7 +11,9 @@
 
 [Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)に沿って、RLSが必要な表、適用role、操作、tenant IDの信頼元を決める。RLSの有効フラグとpolicyを照合する。RLS有効で適用できるpermissive policyがない場合はdefault deny。ALL/UPDATEではWITH CHECK省略時のUSINGも評価する。permissiveのORとrestrictiveのAND、UPDATEで必要なSELECT policy、ACL、ownerのFORCE、SUPERUSER/BYPASSRLSを確認する。TRUNCATE/REFERENCESはACLで管理する。
 
-親を通るアクセスと子partitionへの直接接続、view所有者とsecurity_invoker、materialized viewのコピー、SECURITY DEFINERの所有者を調べる。viewの依存関係は候補であり、view自身のフィルタを別途確認する。SQL関数、動的SQL、外部コードの到達先は、許可されたソースから追加調査する。
+親を通るアクセスと、[子への直接アクセス](https://www.postgresql.org/docs/current/ddl-inherit.html)を分ける。直接アクセスでは子自身のRLS・policyが適用されるため、有効フラグのある子もschema/table権限、実効ロール、owner/FORCE/BYPASSRLS、操作別policyを確認する。子のpermissiveにtrueがあっても、適用されるrestrictiveが絞るなら漏えいと断定しない。任意の式や関数は子・ロール・操作を指定したunknownとし、その経路のtenant CRUD試験へ進む。default denyのpassは当該子の当該操作だけを意味し、親や別操作の安全性は含まない。[policyの合成と操作条件](https://www.postgresql.org/docs/current/sql-createpolicy.html)に沿い、UPDATE/DELETEの具体的な文で必要なSELECT policyも試す。
+
+view所有者とsecurity_invoker、materialized viewのコピー、SECURITY DEFINERの所有者も調べる。viewの依存関係は候補であり、view自身のフィルタを別途確認する。SQL関数、動的SQL、外部コードの到達先は、許可されたソースから追加調査する。
 
 隔離したテストDBでA/Bの合成データを作り、実アプリと同じログイン、ロール、接続プールで検証する。Aは自分の行を読める。Bの行は見えず、BへのINSERT、tenant変更UPDATE、BのDELETEが拒否または0行になる。tenant IDなし/NULL、同じ接続をA→Bに再利用するケース、view/routine/partition経由も試す。クライアント自身が設定できるGUCを認可の根拠にする場合は、誰がその値を変更できるかを確認する。
 
