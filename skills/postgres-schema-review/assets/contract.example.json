@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "vocabulary": {
+    "terms": [
+      "order",
+      "payment",
+      "shipment"
+    ],
+    "allowed_abbreviations": [
+      "id",
+      "sku"
+    ]
+  },
+  "tables": [
+    {
+      "relation": "public.orders",
+      "source": "design/orders.md:12",
+      "row_meaning": "one accepted order",
+      "kind": "entity",
+      "required_columns": [
+        "id",
+        "tenant_id",
+        "customer_id"
+      ],
+      "relationships": [
+        {
+          "columns": [
+            "tenant_id",
+            "customer_id"
+          ],
+          "referenced_relation": "public.customers",
+          "referenced_columns": [
+            "tenant_id",
+            "id"
+          ],
+          "enforce": true,
+          "allow_null": false,
+          "delete_action": "r",
+          "update_action": "a",
+          "match_type": "s",
+          "source": "design/orders.md:20"
+        }
+      ],
+      "column_groups": [
+        {
+          "name": "payment",
+          "columns": [
+            "is_paid",
+            "paid_at"
+          ],
+          "lifecycle": "payment",
+          "writers": [
+            "payment"
+          ],
+          "created_by": "payment accepted",
+          "finalized_by": "payment confirmed",
+          "retention": "7 years"
+        },
+        {
+          "name": "shipment",
+          "columns": [
+            "is_shipped",
+            "shipped_at"
+          ],
+          "lifecycle": "shipment",
+          "writers": [
+            "shipment"
+          ],
+          "created_by": "shipment requested",
+          "finalized_by": "carrier accepted",
+          "retention": "3 years"
+        }
+      ],
+      "flags": [
+        {
+          "columns": [
+            "is_paid"
+          ],
+          "meaning": "event",
+          "source_column": "paid_at",
+          "invariant": "is_paid is true exactly when paid_at is present"
+        }
+      ]
+    },
+    {
+      "relation": "public.payment_events",
+      "source": "design/payments.md:8",
+      "row_meaning": "one confirmed payment event",
+      "kind": "event",
+      "immutable_after": "confirmed",
+      "required_columns": [
+        "id",
+        "order_id",
+        "occurred_at"
+      ]
+    }
+  ]
+}
