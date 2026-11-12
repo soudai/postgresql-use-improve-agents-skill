@@ -140,3 +140,7 @@ tests/                   ユニットテスト・隔離環境のDBシナリオ
 README.md                英語ガイド
 README_ja.md             日本語ガイド
 ```
+
+## ライセンス
+
+[MIT License](LICENSE)

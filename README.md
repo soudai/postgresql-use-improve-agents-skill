@@ -140,3 +140,7 @@ tests/                   Unit tests and isolated PostgreSQL scenarios
 README.md                English guide
 README_ja.md             Japanese guide
 ```
+
+## License
+
+[MIT License](LICENSE)
