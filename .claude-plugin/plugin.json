@@ -1,0 +1,20 @@
+{
+  "name": "postgresql-skills",
+  "version": "0.1.0",
+  "description": "PostgreSQL 18/19 skills: performance diagnostics, configuration tuning, schema review, security review and workload validation, each with evidence collectors and offline analyzers.",
+  "author": {
+    "name": "soudai",
+    "url": "https://github.com/soudai"
+  },
+  "homepage": "https://github.com/soudai/postgresql-use-improve-agents-skill",
+  "repository": "https://github.com/soudai/postgresql-use-improve-agents-skill",
+  "license": "MIT",
+  "keywords": [
+    "postgresql",
+    "performance",
+    "tuning",
+    "schema-review",
+    "security",
+    "benchmark"
+  ]
+}

@@ -32,6 +32,21 @@ These tiny fixtures demonstrate the decision logic; they are not benchmark measu
 
 ## Use a skill with your agent
 
+### Claude Code plugin
+
+This repository is also a Claude Code plugin marketplace. In Claude Code, run:
+
+```text
+/plugin marketplace add soudai/postgresql-use-improve-agents-skill
+/plugin install postgresql-skills@postgresql-use-improve-agents-skill
+```
+
+All five skills are installed together. Claude selects a skill from its description, or you can name it explicitly, for example `/postgresql-skills:postgres-performance-diagnostics`. Update with `/plugin marketplace update postgresql-use-improve-agents-skill`. To try a local checkout without installing, start Claude Code with `claude --plugin-dir /path/to/postgresql-use-improve-agents-skill`.
+
+The bundled scripts need Python 3.10 or later on the machine where Claude Code runs, and `psql` (or `--docker-container`) for collectors that connect to PostgreSQL.
+
+### Other agents
+
 Copy the complete folder for each skill you need from `skills/` into your agent's configured skill discovery directory. Keep its `SKILL.md`, `scripts/`, `sql/`, `references/` and `assets/` together where present. Check existing installations before replacing them. The discovery path and invocation syntax depend on your agent.
 
 The examples use `$skill-name` invocation. For an agent that accepts it:
@@ -132,6 +147,7 @@ The integration runner uses disposable containers with synthetic data, no networ
 ## Repository layout
 
 ```text
+.claude-plugin/          Claude Code plugin and marketplace manifests
 skills/                  Five self-contained skills, scripts and references
 example/en/              English prompts and example reports
 example/ja/              Japanese prompts and example reports

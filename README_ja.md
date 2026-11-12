@@ -32,6 +32,21 @@ JSONに`"decision": "rollback_candidate"`が出力されます。変更後の合
 
 ## エージェントで使う
 
+### Claude Codeのプラグイン
+
+このリポジトリはClaude Codeのプラグインマーケットプレイスでもあります。Claude Codeで次を実行します。
+
+```text
+/plugin marketplace add soudai/postgresql-use-improve-agents-skill
+/plugin install postgresql-skills@postgresql-use-improve-agents-skill
+```
+
+5つのskillがまとめて導入されます。Claudeは説明文から適したskillを選びます。`/postgresql-skills:postgres-performance-diagnostics`のように明示して呼び出すこともできます。更新は`/plugin marketplace update postgresql-use-improve-agents-skill`で行います。導入せずに手元のcheckoutを試す場合は、`claude --plugin-dir /path/to/postgresql-use-improve-agents-skill`でClaude Codeを起動します。
+
+付属スクリプトの実行には、Claude Codeを動かすマシンにPython 3.10以降が必要です。PostgreSQLへ接続する収集スクリプトには`psql`（または`--docker-container`）も必要です。
+
+### その他のエージェント
+
 `skills/`から必要なskillのフォルダ全体を、利用するエージェントのskill探索ディレクトリへ配置します。含まれる`SKILL.md`、`scripts/`、`sql/`、`references/`、`assets/`は一緒に配置してください。既存の同名skillがある場合は、差分を確認してから置き換えます。探索先と呼び出し構文はエージェントによって異なります。
 
 利用例では`$skill-name`の形式で呼び出します。この構文に対応するエージェントへの依頼例です。
@@ -132,6 +147,7 @@ python tests/integration.py --image postgres:18-bookworm
 ## ディレクトリ構成
 
 ```text
+.claude-plugin/          Claude Codeのプラグインとマーケットプレイスの定義
 skills/                  5つの独立したskillとスクリプト・参照資料
 example/en/              英語のプロンプト・レポート例
 example/ja/              日本語のプロンプト・レポート例

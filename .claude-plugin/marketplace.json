@@ -1,0 +1,20 @@
+{
+  "name": "postgresql-use-improve-agents-skill",
+  "owner": {
+    "name": "soudai",
+    "url": "https://github.com/soudai"
+  },
+  "metadata": {
+    "description": "PostgreSQL diagnostics and review skills for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "postgresql-skills",
+      "source": "./",
+      "description": "PostgreSQL 18/19 skills: performance diagnostics, configuration tuning, schema review, security review and workload validation.",
+      "category": "database",
+      "homepage": "https://github.com/soudai/postgresql-use-improve-agents-skill",
+      "license": "MIT"
+    }
+  ]
+}
