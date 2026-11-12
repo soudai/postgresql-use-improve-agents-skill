@@ -6,7 +6,9 @@ activity、locks、prepared transactionsのsnapshotを使う。発生中なら�
 
 `analyze.py`の`current.lock_chains`は、snapshotの`pg_blocking_pids()`から根本blocker（自身は待っていないblocker）ごとに、間接的な待機者を含む数（`blocked_sessions`）、最長の待機段数（`max_depth`）、直接の待機者を示す。根本のない循環は`cycle_pids`として、`deadlock_timeout`前の未解決deadlockの候補を示す。DDLの待機列に並んだSELECTは、DDLのセッションをblockerとして持つ。
 
-`pg_blocking_pids()`を起点に待機元からblockerを辿り、根本blocker、待機チェーン、影響セッション数、対象DB／relation、lock modeを示す。単純な`pg_locks`自己JOINだけでblockerを確定しない。多数のセッションへ高頻度で繰り返し呼ぶと観測負荷があるため、必要な頻度に絞る。
+`pg_blocking_pids()`を起点に待機元からblockerを辿り、根本blocker、待機チェーン、影響セッション数、対象DB／relation、lock modeを示す。単純な`pg_locks`自己JOINだけでblockerを確定しない。この関数は呼ぶたびにlock manager全体をロックするため、収集の`activity`と`locks`は未付与のロック要求を持つセッションだけに呼ぶ。他のセッションの`blocking_pids`はnullで、「blockerなし」の確認結果ではない。
+
+収集の`locks`節は待機に関わるロックだけを残す。未付与の要求すべてと、待機者およびそのblockerが保持するロック、待機者を止めているprepared transactionのロック。関係のないセッションの付与済みロックは含まない。空の`locks`は「その瞬間にロック待ちがない」であり、「ロックがない」ではない。
 
 | 観測 | 解釈 |
 | --- | --- |
@@ -26,6 +28,8 @@ activity、locks、prepared transactionsのsnapshotを使う。発生中なら�
 ## deadlockと過去の待機
 
 deadlock件数は傾向であり、原因となるSQLの一覧ではない。SQLSTATE、DETAIL、SQL、PID／session、時刻をログから再構成する。JSONログは`analyze_logs.py`でイベントを抽出し、必要に応じて本文を限定して読む。
+
+PostgreSQL 19の`pg_stat_lock`は、`deadlock_timeout`より長く待って取得されたロックの回数と待ち時間をlocktype別に累積する。`analyze.py`は`deltas.lock_stats`に区間の`waits`、`wait_time`、`mean_wait_ms`、`fastpath_exceeded`を出す。短い待ちと、取得前にtimeout・cancelされた待ちは含まないため、0でもロック待ちがなかった証明にはならない。18にはこのビューがなく、欠測として警告しない。
 
 `log_lock_waits`は`deadlock_timeout`を超えた待機を記録する。ログがなければ待機がなかった、という判断はしない。`deadlock_timeout`は検出とログの条件にも関わり、単なるクエリ実行上限ではない。
 

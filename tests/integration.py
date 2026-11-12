@@ -128,6 +128,84 @@ def check_relation_inspection(container):
     assert psql(container, "SELECT count(*) FROM pgskills_fixture.accounts;").stdout.strip() == "20000"
 
 
+def check_tool_statements_and_locks(container, directory):
+    """The tools must not appear in the statistics they explain, nor fail behind a queued DDL."""
+    psql(container, """
+CREATE TABLE IF NOT EXISTS pgskills_fixture.fk_parent (id integer PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS pgskills_fixture.fk_child (
+    id integer PRIMARY KEY, parent_id integer REFERENCES pgskills_fixture.fk_parent (id), indexed_id integer
+        REFERENCES pgskills_fixture.fk_parent (id));
+CREATE INDEX IF NOT EXISTS fk_child_indexed ON pgskills_fixture.fk_child (indexed_id, id);
+CREATE INDEX IF NOT EXISTS accounts_never_scanned ON pgskills_fixture.accounts (payload);
+""")
+    before = collect(container, directory / "tools-before.json")
+    run([sys.executable, str(SCRIPTS / "sample_activity.py"), "--docker-container", container,
+         "--instance-id", container, "--samples", "4", "--interval", "0.5", "--output", str(directory / "tools-samples.json")])
+    # A session keeps ACCESS SHARE while an ALTER TABLE queues behind it: size functions would wait too.
+    holder = subprocess.Popen(["docker", "exec", "-i", container, "psql", "-X", "-q", "-c",
+                               "BEGIN; SELECT count(*) FROM pgskills_fixture.accounts; SELECT pg_sleep(8); COMMIT;"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ddl = None
+    try:
+        time.sleep(1)
+        ddl = subprocess.Popen(["docker", "exec", "-i", container, "psql", "-X", "-q", "-c",
+                                "ALTER TABLE pgskills_fixture.accounts ADD COLUMN IF NOT EXISTS queued_ddl integer;"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        path = directory / "tools-after.json"
+        run([sys.executable, str(SCRIPTS / "collect.py"), "--docker-container", container, "--instance-id", container,
+             "--include-query-text", "--output", str(path)])
+        after = json.loads(path.read_text(encoding="utf-8"))
+    finally:
+        for process in (holder, ddl):
+            if process is not None:
+                process.wait(timeout=60)
+    errors = {name: s.get("reason") for name, s in after["sections"].items() if s["status"] == "error"}
+    assert not errors, f"Sections failed while DDL was queued: {errors}"
+    accounts = next(r for r in after["sections"]["tables"]["rows"] if r["relname"] == "accounts")
+    assert accounts["size_skipped_locked"] and accounts["total_bytes"] is None, "Size of a locked table was read"
+    assert accounts["n_live_tup"] is not None, "Statistics of the locked table were lost"
+    other = next(r for r in after["sections"]["tables"]["rows"] if r["relname"] == "fk_child")
+    assert other["size_skipped_locked"] is False and other["total_bytes"] is not None
+    definitions = {r["indexrelname"]: r.get("indexdef") for r in after["sections"]["indexes"]["rows"]}
+    assert definitions["accounts_tenant_id"] is None and definitions["fk_child_indexed"], definitions
+    waiting = [r for r in after["sections"]["locks"]["rows"] if r["granted"] is False]
+    assert waiting and waiting[0]["mode"] == "AccessExclusiveLock" and waiting[0]["blocking_pids"], waiting
+    involved = {r["pid"] for r in waiting} | {pid for r in waiting for pid in r["blocking_pids"]}
+    assert {r["pid"] for r in after["sections"]["locks"]["rows"]} <= involved, "Locks of uninvolved sessions collected"
+    # pg_stat_statements keeps a comment after the first keyword, so the marker removes the tools' SELECTs.
+    texts = [r.get("query") or "" for r in after["sections"]["pgss"]["rows"]]
+    assert texts and not any("jsonb_build_object" in t or "pg_sleep" in t for t in texts), "Tool SQL was collected"
+    marked = psql(container, "SELECT count(*) FROM diagnostics.pg_stat_statements "
+                             "WHERE query LIKE '%/* postgres-performance-diagnostics */%';").stdout.strip()
+    assert int(marked) > 0, "The marker did not survive in pg_stat_statements"
+    samples = json.loads((directory / "tools-samples.json").read_text(encoding="utf-8"))
+    assert samples["summary"]["samples"] == 4 and samples["pacing"]["late_samples"] == 0, samples["pacing"]
+    assert samples["summary"]["connections"]["max_connections"] > 0
+    keys = {r["constraint_name"]: r["supporting_index"] for r in after["sections"]["foreign_keys"]["rows"]}
+    assert keys == {"fk_child_parent_id_fkey": None, "fk_child_indexed_id_fkey": "fk_child_indexed"}, keys
+    ages = after["sections"]["database_ages"]["rows"]
+    assert any(r["is_current"] for r in ages) and any(r["datname"] == "template0" for r in ages)
+    assert after["sections"]["recovery_state"]["rows"] == [{
+        "in_recovery": False, "receive_lsn": None, "replay_lsn": None, "receive_replay_gap_bytes": None,
+        "last_replay_xact_time": None, "replay_delay_seconds": None, "replay_pause_state": None}]
+    report_path = directory / "tools-report.json"
+    compare(directory / "tools-before.json", directory / "tools-after.json", report_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    current = report["current"]
+    assert [x["constraint"] for x in current["unindexed_foreign_keys"]] == ["fk_child_parent_id_fkey"]
+    assert any(x["index"] == "accounts_never_scanned" for x in current["unused_indexes"]), current["unused_indexes"]
+    assert current["freeze_age"]["databases"] and current["freeze_age"]["closest_table"]
+    assert any("sizes of" in w and "were not read" in w for w in report["warnings"]), report["warnings"]
+    markdown = run([sys.executable, str(SCRIPTS / "analyze.py"), str(directory / "tools-before.json"),
+                    str(directory / "tools-after.json"), "--top", "20"]).stdout
+    assert "```json" not in markdown and len(markdown.splitlines()) < 600, "Markdown report is not a digest"
+    relation = json.loads(run(["docker", "exec", "-i", container, "psql", "-X", "-qAt", "--no-password",
+                               "--set=relation=pgskills_fixture.fk_child", "--file=-"],
+                              sql=RELATION_SQL.read_text(encoding="utf-8")).stdout)
+    assert all(c["effective_statistics_target"] == 100 for c in relation["columns"]), relation["columns"]
+
+
 def exercise(container, directory):
     psql(container, FIXTURE.read_text(encoding="utf-8"))
     check_relation_inspection(container)
@@ -197,6 +275,7 @@ def exercise(container, directory):
     assert limited["sections"]["tables"]["truncated"], "Row limit did not mark truncation"
     assert limited["sections"]["pgss"]["truncated"], "SQL row limit did not mark truncation"
     assert len(limited["sections"]["pgss"]["rows"]) == 1
+    check_tool_statements_and_locks(container, directory)
     return {"server_version": after["metadata"]["server_version"],
             "ok_sections": sum(s["status"] == "ok" for s in after["sections"].values()),
             "unavailable_sections": [n for n, s in after["sections"].items()
@@ -206,7 +285,10 @@ def exercise(container, directory):
                        "default SQL redaction", "interval counters", "temp spill",
                        "reset suppression", "instance rejection", "truncation",
                        "targeted planner statistics", "quoted regclass input",
-                       "xmin age columns", "activity sampling", "settings export and config review"]}
+                       "xmin age columns", "activity sampling", "settings export and config review",
+                       "tool SQL excluded by marker", "collection behind queued DDL", "involved locks only",
+                       "client-paced sampling", "foreign keys, freeze age and index candidates",
+                       "compact markdown report"]}
 
 
 def main(argv=None):

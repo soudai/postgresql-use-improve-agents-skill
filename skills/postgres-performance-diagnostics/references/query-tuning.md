@@ -26,6 +26,8 @@ psql -X -qAt --set ON_ERROR_STOP=1 --set relation=public.orders --file sql/inspe
 python scripts/analyze_plan.py plan.json --format markdown --output plan-report.md
 ```
 
+Markdownは1ノード1行で、`--max-nodes`（既定80）まで載せる。JSONレポートは常に全ノードを持つ。auto_explainのログにある計画は`analyze_logs.py --extract-plans DIR`でファイルにでき、そのまま渡せる（[collection.md](collection.md#計画とログを追加する)）。
+
 式や条件を出力したい場合は、共有範囲を確認して`--include-details`を追加する。計画を追加取得するときはまず通常の`EXPLAIN (SETTINGS, FORMAT JSON)`を検討する。実測が必要なら、対象SQLの実行権限と負荷・副作用を評価した上で、例えば次のオプションを使う。
 
 ```sql
@@ -68,6 +70,16 @@ JOINでは内側アクセスの反復数と返却量、ORDER BY／LIMITでは必
 索引候補には、容量、INSERT／UPDATE／DELETEとWALの追加コスト、制約との関係、作成中の負荷・ロック、失敗時の扱いを添える。`CREATE INDEX CONCURRENTLY`にも制約と負荷がある。重複／未使用候補は、十分な観測期間、稀なバッチ、standbyでの利用、制約依存を確認してから扱う。`idx_scan=0`だけで削除しない。
 
 `analyze.py`の`redundant_indexes`は、同じテーブルで別索引のキー列の先頭と一致する非uniqueのB-tree索引を示す。式・部分索引・INCLUDE付き・制約用の索引は対象外。短い索引の方が小さく速い場合や、standby・稀なバッチだけが使う場合があるため、削除前に計画への影響を確認する。
+
+`current`には次の索引候補も出る。いずれも1時点の規則ベースの候補。
+
+- `unused_indexes`: 統計開始以降`idx_scan=0`で、unique・主キー・排他・制約に使われない有効な索引。サイズ順で、テーブルの書込行数と`statistics_since`（索引またはDBの`stats_reset`）を添える。合計は`unused_indexes_total`。scanカウンタはクラッシュやresetで0に戻り、standbyでの利用は数えない。観測期間が月次処理等を含むか確認してから扱う。
+- `invalid_indexes`: `indisvalid`か`indisready`がfalseの索引。失敗・中断した`CREATE INDEX CONCURRENTLY`／`REINDEX CONCURRENTLY`の残骸は、書込のたびに保守されるが計画には使われない。`build_in_progress=true`は採取時点で作成中（`create_index_progress`）なので異常ではない。
+- `unindexed_foreign_keys`: 参照側の列で始まる有効な非部分B-tree（単一列ならhashも可）索引がない外部キー。参照先でDELETEやキーのUPDATEがあるたび、RIトリガーが参照側を走査し、その間ロックを保持する。区間の参照先`n_tup_del`／`n_tup_upd`が0なら潜在コストで、観測された負荷ではない。参照側の`seq_scan`増分と`child_estimated_bytes`を併せて見る。
+
+`deltas.tables`の`seq_tup_per_scan`は区間のSeq Scan 1回あたりの読取行数。頻繁に走査される大きな値の表は、「少数行のための全件走査」をテーブル側から見た候補になる。該当SQLは`pg_stat_statements`と計画で特定する。
+
+`current.create_index_progress`は採取時点の`CREATE INDEX`／`REINDEX`のphaseと進捗。CONCURRENTLYの`waiting for ...`のphaseでは、`lockers_total`／`lockers_done`／`current_locker_pid`が作成を待たせている古いトランザクションを示す。
 
 ## 代表的な書き換え
 

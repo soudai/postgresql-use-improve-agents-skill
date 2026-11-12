@@ -24,6 +24,15 @@ METRICS = (
     "Original Hash Buckets", "Hash Batches", "Original Hash Batches", "Peak Memory Usage",
     "HashAgg Batches", "Disk Usage", "Workers Planned", "Workers Launched",
     "Exact Heap Blocks", "Lossy Heap Blocks", "Cache Hits", "Cache Misses", "Cache Evictions",
+    # PostgreSQL 18: index descents per scan node, and tuplestore size of Material/CTE/WindowAgg nodes.
+    "Index Searches", "Maximum Storage", "WAL Buffers Full",
+)
+# Shown in the Markdown digest next to the row counts; the JSON report keeps every metric.
+DIGEST_METRICS = (
+    "Actual Total Time", "Rows Removed by Filter", "Rows Removed by Join Filter", "Rows Removed by Index Recheck",
+    "Heap Fetches", "Index Searches", "Shared Hit Blocks", "Shared Read Blocks", "Temp Read Blocks",
+    "Temp Written Blocks", "Shared I/O Read Time", "I/O Read Time", "Sort Space Used", "Hash Batches",
+    "Disk Usage", "Maximum Storage", "Workers Planned", "Workers Launched", "Subplans Removed", "WAL Bytes",
 )
 DETAIL_FIELDS = (
     "Filter", "Index Cond", "Hash Cond", "Merge Cond", "Join Filter", "Sort Key",
@@ -33,7 +42,11 @@ LIMITATIONS = [
     "Candidates are investigation leads, not proof of a missing index or an unsafe setting.",
     "Actual Rows and rows removed are per-loop averages; total output is approximate when rounded.",
     "Costs, node times and buffer counters include child work; do not sum them over the tree.",
-    "LIMIT, semi/anti joins and other early exits can prevent a node from running to completion.",
+    "LIMIT, semi/anti joins and other early exits can prevent a node from running to completion. Nodes under a "
+    "Limit and the inner side of a semi/anti nested loop are marked partial and not judged; EXISTS subplans and "
+    "merge joins that stop early are not recognized.",
+    "Row-estimate mismatches compare estimate and actual from one row up and weigh them over all loops.",
+    "An auto_explain plan has no Execution Time; shares then use the logged duration or the root node's time.",
     "Parallel node averages and worker distributions require inspecting the original plan.",
     "A saved plan does not describe all parameter values, concurrency levels or cache conditions.",
     "Parameter tokens alone cannot establish generic/custom plan mode; known mode requires capture provenance.",
@@ -194,6 +207,7 @@ def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, re
         raise ValueError("Invalid capture source")
     if mode != "unknown" and (not isinstance(source, str) or not source.strip()):
         raise ValueError("Known plan mode requires a capture source")
+    logged_ms = capture.get("logged_duration_ms")
     capture = {"plan_mode": mode, "source": source}
 
     report = {"schema_version": 1, "kind": "explain_analysis", "plans": [],
@@ -205,6 +219,16 @@ def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, re
         for source, target in (("Planning Time", "planning_time_ms"), ("Execution Time", "execution_time_ms")):
             if number(document.get(source)):
                 plan[target] = document[source]
+        # auto_explain logs no Execution Time; the duration in its log line is the closest measure.
+        if number(logged_ms):
+            plan["logged_duration_ms"] = logged_ms
+        # Non-default planner settings (EXPLAIN SETTINGS) explain a plan that production would not choose.
+        if isinstance(document.get("Settings"), dict):
+            plan["settings"] = {key: value for key, value in document["Settings"].items()
+                                if isinstance(key, str) and isinstance(value, str)}
+        identifier = document.get("Query Identifier")
+        if isinstance(identifier, int) and not isinstance(identifier, bool):
+            plan["query_id"] = str(identifier)  # Links the plan to pg_stat_statements and wait samples.
         if isinstance(document.get("JIT"), dict):
             plan["jit"] = numeric_tree(document["JIT"])
         triggers = document.get("Triggers")
@@ -220,14 +244,17 @@ def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, re
             if slowest.get("Time", 0) >= max(10, plan.get("execution_time_ms", 0) * 0.1):
                 plan["candidates"].append({"kind": "dml_trigger_time", "path": "Triggers", "evidence": slowest,
                     "next_step": "Check trigger timing, foreign key indexes and nested statements. Trigger time can overlap node time."})
-        stack = [(document["Plan"], "Plan", False)]
+        # early: why a node may have stopped before reading all its rows ("limit" or "semi_join").
+        stack = [(document["Plan"], "Plan", None)]
         while stack:
-            raw, path, below_limit = stack.pop()
+            raw, path, early = stack.pop()
+            below_limit = early == "limit"
             if not isinstance(raw, dict) or not isinstance(raw.get("Node Type"), str):
                 raise ValueError("Every plan node must have a string Node Type")
             node = {"path": path, "node_type": raw["Node Type"], "metrics": numeric_fields(raw)}
             for source, target in (("Relation Name", "relation"), ("Schema", "schema"),
                                    ("Index Name", "index_name"), ("Parent Relationship", "relationship"),
+                                   ("Join Type", "join_type"), ("Storage", "storage"),
                                    ("Sort Method", "sort_method"), ("Sort Space Type", "sort_space_type")):
                 if isinstance(raw.get(source), str):
                     node[target] = raw[source]
@@ -249,18 +276,38 @@ def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, re
             if number(loops) and loops == 0:
                 cardinality["status"] = "not_executed"
             elif executed and number(actual) and number(estimated):
-                cardinality = {"status": "partial_under_limit" if below_limit else "observed",
+                status = ("partial_under_limit" if below_limit else
+                          "partial_early_exit" if early else "observed")
+                cardinality = {"status": status,
                                "actual_rows_per_loop": actual, "plan_rows": estimated,
                                "loops": loops, "approximate_total_output_rows": actual * loops,
                                "actual_over_estimate": actual / estimated if estimated > 0 else None}
-                if not below_limit:
-                    factor = max(actual, estimated) / min(actual, estimated) if min(actual, estimated) > 0 else None
-                    if max(actual, estimated) >= 1000 and (factor is None or factor >= 10):
+                if not early:
+                    # The planner never estimates below one row, and an actual 0 can be a rounded
+                    # per-loop average: compare both from one row up. Size is judged over all
+                    # loops, because a small per-loop miss on the inner side of a nested loop
+                    # multiplies into the join's row count.
+                    low, high = sorted((max(actual, 1), max(estimated, 1)))
+                    if high * loops >= 1000 and high / low >= 10:
                         plan["candidates"].append({"kind": "cardinality_mismatch", "path": path,
                                                    "evidence": cardinality.copy(),
                                                    "next_step": "Check early exits, parameter skew, ANALYZE and column correlation before changing indexes."})
             node["cardinality"] = cardinality
             if executed:
+                join_removed = raw.get("Rows Removed by Join Filter")
+                if (number(join_removed) and number(actual) and join_removed * loops >= 100000
+                        and join_removed / max(join_removed + actual, 1) >= 0.9):
+                    plan["candidates"].append({"kind": "join_filter_discards", "path": path,
+                                               "evidence": {"removed_per_loop": join_removed, "output_per_loop": actual,
+                                                            "loops": loops,
+                                                            "approximate_total_removed": join_removed * loops},
+                                               "next_step": "Rows were paired and then rejected by the join filter; check for an "
+                                                            "equality join key that an index or hash join could use, and the join order."})
+                if raw.get("Storage") == "Disk" and number(raw.get("Maximum Storage")):
+                    plan["candidates"].append({"kind": "tuplestore_disk", "path": path,
+                                               "evidence": {"maximum_storage_kb": raw["Maximum Storage"]},
+                                               "next_step": "A materialized result (Material, CTE or WindowAgg) exceeded work_mem and went "
+                                                            "to disk; check whether it must be materialized, its rows and width, then scoped work_mem."})
                 removed = raw.get("Rows Removed by Filter")
                 # Per-loop values: a small removal repeated by a nested loop is still large in total.
                 if (number(removed) and number(actual) and removed * loops >= 10000
@@ -338,8 +385,16 @@ def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, re
             children = raw.get("Plans", [])
             if not isinstance(children, list):
                 raise ValueError("Plans must be an array when present")
+            # A semi or anti nested loop stops reading its inner side at the first match, so that
+            # side's actual rows are not comparable with its estimate (which is for a full scan).
+            stops_inner = raw["Node Type"] == "Nested Loop" and raw.get("Join Type") in ("Semi", "Anti")
             for child_index in reversed(range(len(children))):
-                stack.append((children[child_index], f"{path}/Plans/{child_index}", below_limit or raw["Node Type"] == "Limit"))
+                child = children[child_index]
+                inherited = early or ("limit" if raw["Node Type"] == "Limit" else None)
+                if (not inherited and stops_inner and isinstance(child, dict)
+                        and child.get("Parent Relationship") == "Inner"):
+                    inherited = "semi_join"
+                stack.append((child, f"{path}/Plans/{child_index}", inherited))
         plan["root_buffers"] = {key: value for key, value in plan["nodes"][0]["metrics"].items() if "Blocks" in key}
         children_by_path = {}
         for child in plan["nodes"][1:]:
@@ -352,7 +407,16 @@ def analyze(data, include_details=False, *, plan_mode=None, plan_source=None, re
             for node in plan["nodes"]
             if node["node_type"] in ("Append", "Merge Append")
         ]
-        plan["hotspots"] = hotspots(plan["nodes"], plan.get("execution_time_ms"))
+        # Shares need a total: EXPLAIN's Execution Time, else the duration auto_explain logged,
+        # else the root node's own inclusive time (which excludes triggers and planning).
+        root_metrics = plan["nodes"][0]["metrics"]
+        root_ms = (root_metrics["Actual Total Time"] * root_metrics["Actual Loops"]
+                   if number(root_metrics.get("Actual Total Time")) and number(root_metrics.get("Actual Loops")) else None)
+        basis = next(((name, value) for name, value in (("execution_time", plan.get("execution_time_ms")),
+                                                        ("logged_duration", plan.get("logged_duration_ms")),
+                                                        ("root_node", root_ms)) if number(value) and value > 0), (None, None))
+        plan["time_basis"] = basis[0]
+        plan["hotspots"] = hotspots(plan["nodes"], basis[1])
         plan["candidates"] += join_candidates(plan["nodes"])
         if mode == "generic" and any(c["kind"] == "cardinality_mismatch" for c in plan["candidates"]):
             plan["candidates"].append({"kind": "generic_plan_misestimate", "path": "Plan",
@@ -381,7 +445,11 @@ def join_candidates(nodes):
         if node["node_type"] not in ("Hash Join", "Merge Join", "Nested Loop") or node["cardinality"]["status"] != "observed":
             continue
         output = node["cardinality"]["approximate_total_output_rows"]
-        for index in range(2):
+        # An anti join returns the rows WITHOUT a partner, so a small output means the opposite.
+        # A semi join returns outer rows only: its inner side says nothing about unmatched rows.
+        if node.get("join_type") == "Anti":
+            continue
+        for index in range(1 if node.get("join_type") == "Semi" else 2):
             child = by_path.get(f"{node['path']}/Plans/{index}")
             if child and child["node_type"] == "Hash":
                 child = by_path.get(child["path"] + "/Plans/0")
@@ -417,13 +485,44 @@ def hotspots(nodes, execution_ms, limit=5):
     return sorted(result, key=lambda x: x["self_ms_approx"], reverse=True)[:limit]
 
 
-def markdown(report):
+def node_line(node):
+    """One line per node for the Markdown digest: identity, estimate against actual, non-zero work."""
+    identity = ".".join(str(node.get(key, "")) for key in ("schema", "relation")).strip(".")
+    parts = [f"`{node['path']}` {node['node_type']}"]
+    parts += [str(node[key]) for key in ("join_type",) if node.get(key)]
+    if identity:
+        parts.append("on " + identity)
+    if node.get("index_name"):
+        parts.append("using " + node["index_name"])
+    cardinality = node["cardinality"]
+    if "plan_rows" in cardinality:
+        rows = (f"rows est {cardinality['plan_rows']:g} / act {cardinality['actual_rows_per_loop']:g}"
+                f" x{cardinality['loops']:g}")
+        if cardinality["status"] != "observed":
+            rows += f" [{cardinality['status']}]"
+    else:
+        rows = cardinality["status"].replace("_", " ")
+    metrics = {key: node["metrics"][key] for key in DIGEST_METRICS if node["metrics"].get(key)}
+    extras = {key: node[key] for key in ("sort_method", "sort_space_type", "storage") if node.get(key)}
+    text = " ".join(parts) + ": " + rows
+    if metrics or extras:
+        text += "; " + json.dumps({**extras, **metrics}, ensure_ascii=False, separators=(", ", ": "))
+    return text
+
+
+def markdown(report, max_nodes=80):
     lines = ["# Execution plan observations", "", "Candidates require confirmation with representative parameters and workload.", ""]
     for plan in report["plans"]:
         lines += [f"## Plan {plan['index'] + 1}", "",
                   f"Planning: {plan.get('planning_time_ms', 'not measured')} ms; execution: {plan.get('execution_time_ms', 'not measured')} ms.", "",
                   "Plan capture: " + json.dumps(plan["plan_capture"], ensure_ascii=False), "",
                   "Root buffer counts (not a sum of all nodes): " + json.dumps(plan["root_buffers"], ensure_ascii=False), ""]
+        if plan.get("logged_duration_ms") is not None:
+            lines += [f"Logged duration (auto_explain): {plan['logged_duration_ms']} ms.", ""]
+        if plan.get("query_id"):
+            lines += [f"Query ID: {plan['query_id']}", ""]
+        if plan.get("settings"):
+            lines += ["Non-default planner settings in effect: " + json.dumps(plan["settings"], ensure_ascii=False), ""]
         if "jit" in plan:
             lines += ["JIT: " + json.dumps(plan["jit"], ensure_ascii=False), ""]
         if plan.get("triggers"):
@@ -433,19 +532,20 @@ def markdown(report):
             lines += ["### Append and pruning evidence", "",
                       json.dumps(plan["partition_evidence"], ensure_ascii=False), ""]
         if plan["hotspots"]:
-            lines += ["### Self-time hotspots (approximate)", ""]
+            basis = {"execution_time": "of Execution Time", "logged_duration": "of the logged duration",
+                     "root_node": "of the root node's time"}.get(plan.get("time_basis"))
+            lines += ["### Self-time hotspots (approximate" + (f"; share {basis}" if basis else "") + ")", ""]
             for spot in plan["hotspots"]:
                 share = f"{spot['share_of_execution']:.0%}" if spot["share_of_execution"] is not None else "—"
                 lines.append(f"- `{spot['path']}` {spot['node_type']} {spot.get('relation') or ''}: {spot['self_ms_approx']:.3f} ms ({share})")
             lines.append("")
-        for node in plan["nodes"]:
-            identity = ".".join(str(node.get(key, "")) for key in ("schema", "relation")).strip(".")
-            lines += [f"- `{node['path']}`: {node['node_type']} {identity}; cardinality={json.dumps(node['cardinality'], ensure_ascii=False)}",
-                      "  Metrics: " + json.dumps(node["metrics"], ensure_ascii=False)]
-            if node.get("index_name"):
-                lines.append("  Index: " + node["index_name"])
+        lines += ["### Nodes (rows and times are per loop; the JSON report has every metric)", ""]
+        for node in plan["nodes"][:max_nodes]:
+            lines.append("- " + node_line(node))
             if "details" in node:
                 lines.append("  Details: " + json.dumps(node["details"], ensure_ascii=False))
+        if len(plan["nodes"]) > max_nodes:
+            lines.append(f"- {len(plan['nodes']) - max_nodes} more node(s) not shown; raise --max-nodes or use --format json.")
         lines += ["", "### Investigation candidates", ""]
         for candidate in plan["candidates"]:
             lines.append(f"- {candidate['kind']} at `{candidate['path']}`: {json.dumps(candidate['evidence'], ensure_ascii=False)}. {candidate['next_step']}")
@@ -467,7 +567,11 @@ def main(argv=None):
     parser.add_argument("--plan-source", help="Non-secret provenance locator; required for known plan mode")
     parser.add_argument("--relation-evidence", type=Path,
                         help="inspect_relation.sql JSON (one object or a list); use VERBOSE plans for schema matching")
+    parser.add_argument("--max-nodes", type=int, default=80,
+                        help="Nodes listed per plan in Markdown (the JSON report always has all)")
     args = parser.parse_args(argv)
+    if args.max_nodes <= 0:
+        parser.error("--max-nodes must be positive")
     try:
         with args.input.open(encoding="utf-8-sig") as handle:
             data = json.load(handle)
@@ -477,7 +581,8 @@ def main(argv=None):
                 relation_evidence = json.load(handle)
         report = analyze(data, include_details=args.include_details, plan_mode=args.plan_mode,
                          plan_source=args.plan_source, relation_evidence=relation_evidence)
-        output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n" if args.format == "json" else markdown(report)
+        output = (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n" if args.format == "json"
+                  else markdown(report, args.max_nodes))
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(output, encoding="utf-8")

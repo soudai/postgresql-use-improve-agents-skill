@@ -27,6 +27,17 @@ PostgreSQL 18ではVACUUMされていないページのHeap Fetchesが毎回発�
 
 XID／MXID ageはwraparound対策の緊急性に関わる。設定されたfreeze上限、進行速度、進捗、回収を妨げる保持元を確認し、通常の性能改善と区別して優先度を示す。
 
+`current.freeze_age`は、`database_ages`（template0を含むクラスタ内の全DB）と各テーブルのageを`autovacuum_freeze_max_age`／`autovacuum_multixact_freeze_max_age`で割った比を示す。テーブルのreloptionsは上限を下げる方向だけ反映する。
+
+- 比1.0で、autovacuumが無効でもwraparound防止のVACUUMが起動し、通常のロック競合ではキャンセルされない。比が1以上なら`analyze.py`が警告を出す。
+- `past_failsafe_age`は`vacuum_failsafe_age`超過。VACUUMはcost delayと索引の処理を省いて進む。
+- `xids_until_wraparound`は2^31からの残り。クラスタの判定は最も古いDBで決まり、診断中のDBとは限らない。他DBの名前は見えるが統計は読まない。
+- `tables_near_limit`は比0.5以上のテーブル。該当なしでも`closest_table`で最も近い表を確認できる。
+
+比が高いのにageが下がらなければ、`xmin_horizon_holders`の保持元、`vacuum_progress`の進捗、autovacuumログの`cutoff`の古さを確認する。
+
+`current.vacuum_progress`は採取時点で実行中のVACUUMのphase、走査済みブロック、索引処理回数、`delay_time`（`track_cost_delay_timing`有効時）を示す。
+
 対策にはテーブル単位のautovacuum調整、トランザクション短縮、更新設計、ANALYZE、索引再作成等がある。`VACUUM FULL`は強いロック・書き直し・追加容量を伴う。高いdead tuple推定だけで機械的に提案しない。通常VACUUMで再利用が進むことと、ファイル縮小を区別して説明する。
 
 ## WALとチェックポイント
@@ -35,6 +46,8 @@ XID／MXID ageはwraparound対策の緊急性に関わる。設定されたfreez
 
 PostgreSQL 18のWAL I/O timingは`pg_stat_io`の`object=wal`等、実際のビュー定義に沿って取得する。旧版の列を固定して使わない。`track_wal_io_timing`が無効だった区間の時間0は未計測。backendの種類やI/O操作を区別し、同じ処理を重複計上しない。
 
+`deltas.wal`の`fpi_bytes_share`はWAL bytesのうちfull-page imageの割合（PostgreSQL 19の`wal_fpi_bytes`による実測）。18では`fpi_bytes_share_upper_bound`（FPI数×block size÷WAL bytes、圧縮・hole除去前の上限）だけが分かる。FPIはレコード数では数%でもbytesの大半を占め得るため、レコード比を量の割合として扱わない。`deltas.checkpointer`の`requested_ratio`は要求checkpointの割合で、手動CHECKPOINTやbase backupも含む。原因は`analyze_logs.py`の`checkpoints.by_cause`で確認する。
+
 SQLの更新量増大、索引による書き込み増幅、頻繁なcheckpoint、ストレージの遅延を切り分ける。WAL量はデータ更新サイズと一対一ではない。FPIやcheckpoint周期の影響を含め、同じ負荷条件で比較する。
 
 checkpoint／WAL設定の候補は、書き込みの平準化、WAL容量、復旧時間、バックアップ／レプリケーション要件を併記する。耐久性を落とす`fsync`・`full_page_writes`・同期commit等の変更を既定の高速化策にしない。
@@ -42,6 +55,18 @@ checkpoint／WAL設定の候補は、書き込みの平準化、WAL容量、復�
 ## レプリケーションとWAL保持
 
 primary／standbyの役割、同期方式、物理／論理の構成を確認する。replication、receiver、slot、subscription、archive、競合統計、LSNと空き容量を使う。観測時刻を揃え、送信・受信・flush・replayのどこで止まるかを調べる。
+
+primaryの`current.replication`は送信先ごとにWALが止まっている段階をbytesで示す。
+
+| 列 | 区間 | 大きいときに調べるもの |
+| --- | --- | --- |
+| pending_send_gap_bytes | 生成済み→未送信 | walsenderのCPU・ネットワーク送信。cascading standbyではnull |
+| sent_write_gap_bytes | 送信→standbyで未write | ネットワーク、standbyの受信 |
+| write_flush_gap_bytes | write→未flush | standbyのストレージ |
+| flush_replay_gap_bytes | flush→未replay | standbyのreplay（競合、I/O、`recovery_min_apply_delay`） |
+| total_replay_gap_bytes | 生成済み→未replay | 合計 |
+
+standby側の`current.recovery_state`は、受信とreplayのLSN、その差（`receive_replay_gap_bytes`）、最後にreplayしたトランザクションのcommit時刻、`replay_pause_state`を示す。`replay_delay_seconds`はその時刻からの経過で、primaryで更新がなければ追い付いていても増える。差のbytesが0なら追い付いている。primaryでは各列がnull。PostgreSQL 19の`pg_stat_recovery`に依存しないため全対象版で取得できる。`deltas.recovery_prefetch`はstandbyのprefetch統計で、primaryや未対応版では欠けても欠測として警告しない。
 
 lag値を「追い付くまでの予測時間」として説明しない。トラフィックがない時のNULLは直ちに障害を意味しない。同期レプリケーションによるcommit待ちと、非同期standbyのreplay遅延は影響が異なる。
 
@@ -74,5 +99,7 @@ standbyではクエリ競合、replay、読み取り負荷、feedbackのprimary�
 ## 論理レプリケーションの適用停止
 
 `current.subscriptions`でenabledとworkerを照合し、`subscription_relations`の状態から初期コピー中と同期済みを見分ける。enabledでもworkerが見えない場合は、欠測・権限不足を除き、subscriberログと`deltas.subscription_stats`のapply/sync error・競合を確認する。再試行中に一度だけ見たPIDで継続稼働を判断しない。無効化されている場合も、意図した停止か`disable_on_error`かを変更履歴とログで確認する。
+
+PostgreSQL 19の`subscription_stats`は同期エラーを`sync_table_error_count`と`sync_seq_error_count`に分け、`confl_update_deleted`を加える（18の`sync_error_count`は19にない）。`replication_slots`の`mem_exceeded_count`（19）は`logical_decoding_work_mem`超過の回数で、spill／streamの原因を示す。版にない列は差分から外れるだけで、0とは扱わない。
 
 publisherとsubscriberの採取時刻を揃え、slot名、受信・適用の進捗、保持WAL、`replication_slots`のspillとstreamの増分を照合する。subscriberの適用停止とpublisherのデコード負荷は別に対処する。メモリ調整時は並行slotの予算を見積もり、競合の修正や再同期では欠落・二重適用の有無と結果一致を確認する。レポートの時刻は各ビューの収集時刻で、列欠落・権限不足・resetは警告と元snapshotで確認する。[論理レプリケーション監視](https://www.postgresql.org/docs/18/logical-replication-monitoring.html)

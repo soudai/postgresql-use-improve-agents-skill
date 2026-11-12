@@ -24,7 +24,7 @@ description: Diagnose PostgreSQL 18 and 19 performance using wait-event sampling
 1. **DB時間の内訳**: 症状が出ている間に`scripts/sample_activity.py`で待機をサンプリングする。まず`activity_coverage`と欠測の警告を確認し、観測できた平均アクティブセッション数とCPU・I/O・Lock・LWLock等の割合から、読む手順を選ぶ。AASがnullなら観測値は下限として扱う。[wait-events.md](references/wait-events.md)
 2. **SQLの負荷シェア**: `analyze.py`の`exec_time_share`と`sql_total_exec_ms`で、区間のtop-level実行時間の大半を占めるSQLを特定する。短いSQLは`sql_calls`、CPU負荷は`sql_shared_blks_accessed`、更新負荷は`sql_wal_bytes`で見る。
 3. **計画のホットスポット**: 対象SQLのJSON計画を`analyze_plan.py`に通し、`hotspots`の自己時間が大きいノードから候補を確認する。
-4. **保守の詰まり**: `current`の`xmin_horizon_holders`、`autovacuum_backlog`、`redundant_indexes`は1時点の規則ベースの候補。定義と設定を確認し、`autovacuum_unassessed`の欠測を併記してから扱う。
+4. **保守の詰まり**: `current`の`xmin_horizon_holders`、`autovacuum_backlog`、`freeze_age`、`redundant_indexes`、`unused_indexes`、`invalid_indexes`、`unindexed_foreign_keys`は1時点の規則ベースの候補。定義・設定・統計の観測期間を確認し、`autovacuum_unassessed`の欠測を併記してから扱う。`freeze_age`の比が1以上なら、通常の性能改善より優先して扱う。
 
 症状が既に絞られていれば（特定APIだけ遅い、ロック待ちのアラート等）、該当する手順から始めてよい。
 

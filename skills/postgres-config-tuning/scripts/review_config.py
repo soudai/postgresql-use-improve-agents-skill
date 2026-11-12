@@ -257,16 +257,23 @@ class Review:
                             "checkpoint target, not a disk-usage bound; archiving and retained WAL can exceed it.",
                      evidence={"requested": requested, "timed": timed, "wal_bytes_per_s": rate,
                                "cause": "unknown"})
-        fpi = self.ev.get("fpi_share")
-        if raw(self.s, "wal_compression") == "off" and (fpi is None or fpi > 0.2):
+        # Full-page images are a few percent of WAL records but can be most of its bytes, so the
+        # byte share (measured on PostgreSQL 19) decides when present; the record share is the
+        # fallback for 18, where only an upper bound of the byte share is known.
+        fpi, fpi_bytes = self.ev.get("fpi_share"), self.ev.get("fpi_bytes_share")
+        fpi_evidence = {"fpi_share": fpi, "fpi_bytes_share": fpi_bytes,
+                        "fpi_bytes_share_upper_bound": self.ev.get("fpi_bytes_share_upper_bound")}
+        heavy = fpi_bytes > 0.4 if fpi_bytes is not None else (fpi is not None and fpi > 0.2)
+        very_heavy = fpi_bytes > 0.6 if fpi_bytes is not None else (fpi is not None and fpi > 0.3)
+        if raw(self.s, "wal_compression") == "off" and (heavy or (fpi is None and fpi_bytes is None)):
             self.add("wal_compression", "low", "lz4 (or zstd)",
                      "Compresses full-page images, reducing WAL volume, archive and replication traffic for some CPU.",
                      caveat="Requires a build with lz4/zstd; check the accepted values on the server.",
-                     evidence={"fpi_share": fpi})
-        if fpi is not None and fpi > 0.3 and timeout <= 300:
+                     evidence=fpi_evidence)
+        if very_heavy and timeout <= 300:
             self.add("checkpoint_timeout", "low", "15min",
                      "A high share of full-page images after each checkpoint; fewer checkpoints write fewer of them.",
-                     caveat="Raise max_wal_size together and accept longer crash recovery.", evidence={"fpi_share": fpi})
+                     caveat="Raise max_wal_size together and accept longer crash recovery.", evidence=fpi_evidence)
         full = self.ev.get("wal_buffers_full_per_s")
         if full and full > 0.1:
             self.add("wal_buffers", "medium", "64MB", "Backends had to write WAL themselves because WAL buffers were full.",
@@ -367,6 +374,8 @@ class Review:
                   ("log_lock_waits", "off", "on", "Waits longer than deadlock_timeout are logged."),
                   ("log_temp_files", "-1", "10MB", "Identify spilling SQL in the log."),
                   ("log_autovacuum_min_duration", "-1", "10s", "Slow autovacuum runs and their cause in the log."),
+                  # PostgreSQL 19 logs autoanalyze under its own threshold; absent on 18.
+                  ("log_autoanalyze_min_duration", "-1", "10s", "Slow autoanalyze runs in the log (PostgreSQL 19)."),
                   ("log_min_duration_statement", "-1", "SLO-based, e.g. 1s (or log_min_duration_sample)",
                    "Slow statements with their parameters' shape in the log."))
         for name, bad, good, why in checks:
@@ -420,6 +429,8 @@ def evidence_from_report(report: dict | None) -> dict:
         result["wal_buffers_full_per_s"] = wal["per_second"].get("wal_buffers_full")
         records, fpi = wal["delta"].get("wal_records"), wal["delta"].get("wal_fpi")
         result["fpi_share"] = fpi / records if records and fpi is not None else None
+        result["fpi_bytes_share"] = wal.get("fpi_bytes_share")
+        result["fpi_bytes_share_upper_bound"] = wal.get("fpi_bytes_share_upper_bound")
     database = first("database")
     if database:
         result["temp_bytes_per_s"] = database["per_second"].get("temp_bytes")

@@ -17,6 +17,8 @@ python scripts/sample_activity.py --instance-id prod-primary --samples 60 --inte
 - 間隔は通常1秒。1秒未満は観測負荷とデータ量が増えるため、短時間の再現時に限る。
 - サンプル数が少ないと割合の誤差が大きい。数十サンプル未満の割合を断定に使わない。
 - `Lock`待ちのセッションだけ`pg_blocking_pids()`を呼ぶ。待機者が多い障害時は、この呼び出し自体にも負荷がある。
+- 1回のサンプルが間隔より長くかかった場合は、遅れを詰めて連続実行せず、次の間隔から採り直す。遅れた回数と全体の所要時間は`pacing`に残る。
+- 中断（Ctrl+CやSIGTERM）しても、それまでのサンプルでレポートを書き、`error`に`interrupted`を残す。接続の失敗は`collect.py`と同じ固定の分類で示し、メッセージ本文は残さない。
 
 ## 出力を読む
 
@@ -30,6 +32,9 @@ python scripts/sample_activity.py --instance-id prod-primary --samples 60 --inte
 | lock_blockers | ロック待ちを生んだPIDと、待機者の観測回数 |
 | idle_in_transaction | トランザクションを開いたまま待つセッション。最大経過秒 |
 | background | autovacuum、checkpointer、walsender等の待機 |
+| by_database / by_user / by_application | active時間のDB・ロール・application_name別の内訳と主な待機。どの利用者の負荷かを分ける |
+| connections | client backend数の平均・最大と`max_connections` |
+| timeline | 最大120区間に束ねた時系列。区間ごとの平均・最大active、最大Lock待ち、最大の判定不能数。ピークを平均で消さない |
 
 サンプラーの出力はschema version 2。`track_activities`の取得漏れ・無効化や、state／backend_typeの非表示を検出するとAASとpeakは`null`になり、`warnings`に理由を残す。旧サンプルで設定を取得していない場合も未確認になる。非表示のセッションをbackgroundや負荷0として扱わない。`unknown_session_samples=0`でも設定が未取得なら完全な観測とはいえない。`wait_profile`と`by_query_id`のshareは、見えたactiveセッションだけを母数とする。
 
