@@ -39,7 +39,10 @@ SPECS = {
     "io": (("backend_type", "object", "context"), ("reads", "read_bytes", "read_time",
         "writes", "write_bytes", "write_time", "writebacks", "writeback_time", "extends",
         "extend_bytes", "extend_time", "hits", "evictions", "reuses", "fsyncs", "fsync_time")),
-    "wal": ((), ("wal_records", "wal_fpi", "wal_bytes", "wal_buffers_full")),
+    # Columns that exist only on one major are skipped where absent: wal_fpi_bytes,
+    # mem_exceeded_count, slotsync_skip_count and the split sync error counters are PostgreSQL 19;
+    # sync_error_count is PostgreSQL 18 (19 reports sync_table_error_count/sync_seq_error_count).
+    "wal": ((), ("wal_records", "wal_fpi", "wal_bytes", "wal_fpi_bytes", "wal_buffers_full")),
     "checkpointer": ((), ("num_timed", "num_requested", "num_done", "restartpoints_timed",
         "restartpoints_req", "restartpoints_done", "write_time", "sync_time", "buffers_written",
         "slru_written")),
@@ -47,12 +50,20 @@ SPECS = {
     "archiver": ((), ("archived_count", "failed_count")),
     "conflicts": (("datid",), ("confl_tablespace", "confl_lock", "confl_snapshot",
         "confl_bufferpin", "confl_deadlock", "confl_active_logicalslot")),
-    "subscription_stats": (("subid",), ("apply_error_count", "sync_error_count", "confl_insert_exists",
-        "confl_update_origin_differs", "confl_update_exists", "confl_update_missing",
+    "subscription_stats": (("subid",), ("apply_error_count", "sync_error_count", "sync_table_error_count",
+        "sync_seq_error_count", "confl_insert_exists",
+        "confl_update_origin_differs", "confl_update_exists", "confl_update_deleted", "confl_update_missing",
         "confl_delete_origin_differs", "confl_delete_missing", "confl_multiple_unique_conflicts")),
     "replication_slots": (("slot_name",), ("spill_txns", "spill_count", "spill_bytes",
-        "stream_txns", "stream_count", "stream_bytes", "total_txns", "total_bytes")),
+        "stream_txns", "stream_count", "stream_bytes", "mem_exceeded_count", "total_txns", "total_bytes",
+        "slotsync_skip_count")),
+    # PostgreSQL 19 pg_stat_lock: completed lock acquisitions that waited longer than deadlock_timeout.
+    "lock_stats": (("locktype",), ("waits", "wait_time", "fastpath_exceeded")),
+    "recovery_prefetch": ((), ("prefetch", "hit", "skip_init", "skip_new", "skip_fpw", "skip_rep")),
 }
+# Sections that exist only on some majors or roles: their absence is expected, not a data gap.
+OPTIONAL_DELTAS = ("lock_stats", "recovery_prefetch")
+XID_WRAPAROUND = 2 ** 31
 IDENTITY = ("relfilenode", "relname", "indexrelname", "schemaname", "relid")
 LIMITATIONS = [
     "Rankings are investigation candidates, not confirmed causes or universal thresholds.",
@@ -66,7 +77,12 @@ LIMITATIONS = [
     "Collector SELECTs are filtered by a marker, but monitoring BEGIN/SET/COMMIT utility calls may remain in pg_stat_statements.",
     "n_dead_tup is an estimate, not a physical bloat ratio; zero index scans are not permission to drop an index.",
     "exec_time_share uses comparable top-level entries only; nested (track=all) and excluded entries are not in the denominator.",
-    "Redundant-index and autovacuum-backlog lists are rule-based candidates from one snapshot; verify definitions and settings first.",
+    "Redundant-index, never-scanned-index, unindexed-foreign-key, freeze-age and autovacuum-backlog lists are rule-based "
+    "candidates from one snapshot; verify definitions, settings and the statistics window first.",
+    "A never-scanned index may be read only on a standby or by a rare job; scan counters start at the last statistics reset or crash.",
+    "An unindexed foreign key costs time only when the referenced table deletes rows or updates the key; the interval counters show whether it did.",
+    "active_time is credited when a statement finishes: a statement that runs through the interval is missing from average_active_sessions.",
+    "pg_stat_lock (PostgreSQL 19) counts only waits longer than deadlock_timeout; shorter waits appear in wait samples only.",
 ]
 AUTOVACUUM_RELOPTIONS = ("autovacuum_enabled", "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
                          "autovacuum_vacuum_max_threshold", "autovacuum_vacuum_insert_threshold",
@@ -142,7 +158,11 @@ def section_deltas(before, after, name, warnings):
     a = before.get("sections", {}).get(name, {})
     b = after.get("sections", {}).get(name, {})
     if a.get("status") != "ok" or b.get("status") != "ok":
-        warnings.append(f"{name}: unavailable at one or both endpoints")
+        reasons = sorted({str(s.get("reason") or s.get("status") or "not collected") for s in (a, b)
+                          if s.get("status") != "ok"})
+        # A view this server version does not have is not a gap in the evidence.
+        if not (name in OPTIONAL_DELTAS and reasons in (["missing_relation"], ["not collected"])):
+            warnings.append(f"{name}: unavailable at one or both endpoints ({', '.join(reasons)})")
         return []
     if a.get("truncated") or b.get("truncated"):
         warnings.append(f"{name}: truncated snapshot; rankings cover only matching captured rows")
@@ -261,6 +281,22 @@ def section_deltas(before, after, name, warnings):
             result["shared_read_bytes"] = read * after["metadata"]["block_size"] if read is not None else None
         if name == "tables":
             result["hot_update_ratio"] = ratio(delta.get("n_tup_hot_upd"), delta.get("n_tup_upd"))
+            # Rows read per sequential scan: a large value on a frequently scanned table is the
+            # table-side view of "few rows wanted, whole table read".
+            result["seq_tup_per_scan"] = ratio(delta.get("seq_tup_read"), delta.get("seq_scan"))
+        if name == "wal":
+            # Share of WAL volume that is full-page images. Measured on PostgreSQL 19; on 18 only
+            # an upper bound exists (an image is at most one block before compression/hole removal).
+            result["fpi_bytes_share"] = ratio(delta.get("wal_fpi_bytes"), delta.get("wal_bytes"))
+            bound = ratio(delta["wal_fpi"] * after["metadata"]["block_size"], delta.get("wal_bytes")) if "wal_fpi" in delta else None
+            result["fpi_bytes_share_upper_bound"] = min(bound, 1.0) if bound is not None else None
+        if name == "checkpointer":
+            timed, requested = delta.get("num_timed"), delta.get("num_requested")
+            # Requested includes manual CHECKPOINT and base backups: read the log reasons with it.
+            result["requested_ratio"] = (ratio(requested, timed + requested)
+                                         if numeric(timed) and numeric(requested) else None)
+        if name == "lock_stats":
+            result["mean_wait_ms"] = ratio(delta.get("wait_time"), delta.get("waits"))
         if name == "database":
             # active_time is milliseconds spent executing; per wall-clock second it is average active sessions.
             result["average_active_sessions"] = (delta["active_time"] / 1000 / elapsed
@@ -367,6 +403,130 @@ def redundant_indexes(indexes):
                           "idx_scan": row.get("idx_scan")})
             break
     return sorted(found, key=lambda x: x["index_bytes"] if numeric(x["index_bytes"]) else 0, reverse=True)
+
+
+def unused_indexes(indexes, tables, stats_since=None):
+    """Valid indexes that enforce nothing and were never scanned since the statistics began.
+
+    A candidate only: the window may be short, a standby or a rare job may be the only reader,
+    and counters do not survive a crash. Each entry carries what it costs to keep.
+    """
+    writes = {row.get("relid"): sum(row.get(k) or 0 for k in ("n_tup_ins", "n_tup_upd", "n_tup_del"))
+              for row in tables if row.get("relid") is not None}
+    found = []
+    for row in indexes:
+        if (row.get("idx_scan") != 0 or row.get("relkind") not in (None, "i") or row.get("indisvalid") is False
+                or row.get("indisunique") or row.get("indisprimary") or row.get("indisexclusion")
+                or row.get("constraint_names")):
+            continue
+        found.append({"schemaname": row.get("schemaname"), "relname": row.get("relname"),
+                      "index": row.get("indexrelname"), "index_bytes": row.get("index_bytes"),
+                      "idx_scan": 0, "last_idx_scan": row.get("last_idx_scan"),
+                      "table_rows_written": writes.get(row.get("relid")),
+                      "statistics_since": row.get("stats_reset") or stats_since})
+    return sorted(found, key=lambda x: x["index_bytes"] if numeric(x["index_bytes"]) else 0, reverse=True)
+
+
+def invalid_indexes(indexes, progress=()):
+    """Indexes a failed or unfinished CREATE INDEX/REINDEX CONCURRENTLY left behind.
+
+    They are maintained on every write and never used by a plan. One that is being built right
+    now is expected to be invalid, so a running build is reported with it.
+    """
+    building = {row.get("index_relid") for row in progress}
+    found = []
+    for row in indexes:
+        if row.get("indisvalid") is not False and row.get("indisready") is not False:
+            continue
+        found.append({"schemaname": row.get("schemaname"), "relname": row.get("relname"),
+                      "index": row.get("indexrelname"), "index_bytes": row.get("index_bytes"),
+                      "indisvalid": row.get("indisvalid"), "indisready": row.get("indisready"),
+                      "indislive": row.get("indislive"),
+                      "build_in_progress": row.get("indexrelid") in building})
+    return sorted(found, key=lambda x: x["index_bytes"] if numeric(x["index_bytes"]) else 0, reverse=True)
+
+
+def unindexed_foreign_keys(foreign_keys, table_deltas=(), block_size=None):
+    """Foreign keys whose referencing columns no index starts with, largest child first.
+
+    The cost is paid when the referenced table deletes a row or updates its key: the RI trigger
+    then scans the child. The interval's deletes/updates on the referenced table show whether
+    that happens here; without them the entry is a latent cost, not an observed one.
+    """
+    deltas = {entry["identity"].get("relid"): entry for entry in table_deltas}
+    found = []
+    for row in foreign_keys:
+        if row.get("supporting_index") is not None or not row.get("columns"):
+            continue
+        parent = deltas.get(row.get("referenced_relid"), {}).get("delta", {})
+        child = deltas.get(row.get("relid"), {}).get("delta", {})
+        pages = row.get("relpages")
+        found.append({"schemaname": row.get("schemaname"), "relname": row.get("relname"),
+                      "constraint": row.get("constraint_name"), "columns": row.get("columns"),
+                      "references": ".".join(str(row.get(k)) for k in ("referenced_schemaname", "referenced_relname")),
+                      "child_estimated_rows": row.get("reltuples"),
+                      "child_estimated_bytes": pages * block_size if numeric(pages) and numeric(block_size) else None,
+                      "referenced_deletes_in_interval": parent.get("n_tup_del"),
+                      "referenced_updates_in_interval": parent.get("n_tup_upd"),
+                      "child_seq_scans_in_interval": child.get("seq_scan")})
+    return sorted(found, key=lambda x: x["child_estimated_bytes"] or 0, reverse=True)
+
+
+def freeze_age(database_ages, tables, values, top=10):
+    """How close the cluster and its tables are to forced anti-wraparound vacuum.
+
+    Ages are compared with autovacuum_freeze_max_age (table reloptions honoured): at 1.0
+    autovacuum vacuums the table even when disabled and cannot be cancelled by ordinary locks;
+    at vacuum_failsafe_age it drops its cost delay. The oldest database decides for the cluster.
+    """
+    def number(name):
+        try:
+            return int(values[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    xid_limit, mxid_limit = number("autovacuum_freeze_max_age"), number("autovacuum_multixact_freeze_max_age")
+    failsafe = number("vacuum_failsafe_age")
+    databases = []
+    for row in database_ages:
+        if not numeric(row.get("xid_age")):
+            continue
+        databases.append({"datname": row.get("datname"), "is_current": row.get("is_current"),
+                          "xid_age": row["xid_age"], "mxid_age": row.get("mxid_age"),
+                          "xid_age_ratio": ratio(row["xid_age"], xid_limit),
+                          "mxid_age_ratio": ratio(row.get("mxid_age"), mxid_limit),
+                          "xids_until_wraparound": XID_WRAPAROUND - row["xid_age"],
+                          "past_failsafe_age": row["xid_age"] >= failsafe if failsafe else None})
+    databases.sort(key=lambda x: x["xid_age"], reverse=True)
+    relations = []
+    for row in tables:
+        if not numeric(row.get("xid_age")):
+            continue
+        options = dict(item.split("=", 1) for item in row.get("reloptions") or []
+                       if isinstance(item, str) and "=" in item)
+
+        def limit(name, cluster):
+            try:
+                # A table may only lower the cluster-wide limit.
+                return min(float(options[name]), cluster) if cluster else float(options[name])
+            except (KeyError, TypeError, ValueError):
+                return cluster
+
+        xid_ratio = ratio(row["xid_age"], limit("autovacuum_freeze_max_age", xid_limit))
+        mxid_ratio = ratio(row.get("mxid_age"), limit("autovacuum_multixact_freeze_max_age", mxid_limit))
+        worst = max([value for value in (xid_ratio, mxid_ratio) if value is not None], default=None)
+        relations.append({"schemaname": row.get("schemaname"), "relname": row.get("relname"),
+                          "xid_age": row["xid_age"], "mxid_age": row.get("mxid_age"),
+                          "xid_age_ratio": xid_ratio, "mxid_age_ratio": mxid_ratio, "worst_ratio": worst,
+                          "total_bytes": row.get("total_bytes"), "last_autovacuum": row.get("last_autovacuum"),
+                          "last_vacuum": row.get("last_vacuum")})
+    relations.sort(key=lambda x: (x["worst_ratio"] is not None, x["worst_ratio"] or 0, x["xid_age"]), reverse=True)
+    near = [row for row in relations if (row["worst_ratio"] or 0) >= 0.5]
+    return {"autovacuum_freeze_max_age": xid_limit, "autovacuum_multixact_freeze_max_age": mxid_limit,
+            "vacuum_failsafe_age": failsafe, "databases": databases[:top],
+            # Tables past half of their limit; the single oldest is kept so "none" is checkable.
+            "tables_near_limit": near[:top], "tables_near_limit_total": len(near),
+            "closest_table": relations[0] if relations else None}
 
 
 def autovacuum_backlog(tables, values, *, include_unknown=False):
@@ -510,8 +670,18 @@ def analyze(before, after, top=10):
         "slots": ("slot_name", "slot_type", "database", "active", "restart_lsn", "confirmed_flush_lsn",
                   "xmin", "catalog_xmin", "xmin_age", "catalog_xmin_age", "wal_status", "safe_wal_size",
                   "retained_wal_bytes", "in_recovery"),
-        "replication": ("pid", "state", "sync_state", "sent_lsn", "write_lsn", "flush_lsn", "replay_lsn",
-                        "write_lag", "flush_lag", "replay_lag", "backend_xmin_age"),
+        "replication": ("pid", "application_name", "state", "sync_state", "sent_lsn", "write_lsn", "flush_lsn",
+                        "replay_lsn", "write_lag", "flush_lag", "replay_lag", "backend_xmin_age",
+                        "pending_send_gap_bytes", "sent_write_gap_bytes", "write_flush_gap_bytes",
+                        "flush_replay_gap_bytes", "total_replay_gap_bytes"),
+        "recovery_state": ("in_recovery", "receive_lsn", "replay_lsn", "receive_replay_gap_bytes",
+                           "last_replay_xact_time", "replay_delay_seconds", "replay_pause_state"),
+        "vacuum_progress": ("pid", "relid", "phase", "heap_blks_total", "heap_blks_scanned", "heap_blks_vacuumed",
+                            "index_vacuum_count", "indexes_total", "indexes_processed", "delay_time", "mode",
+                            "started_by"),
+        "create_index_progress": ("pid", "relid", "index_relid", "command", "phase", "lockers_total",
+                                  "lockers_done", "current_locker_pid", "blocks_total", "blocks_done",
+                                  "tuples_total", "tuples_done", "partitions_total", "partitions_done"),
         "subscriptions": ("subid", "subname", "enabled", "slot_name", "worker_type", "pid", "leader_pid",
                           "relid", "received_lsn", "latest_end_lsn", "latest_end_time", "last_msg_receipt_time"),
         "subscription_relations": ("subid", "relid", "schema_name", "relation_name", "sync_state", "sync_lsn"),
@@ -530,12 +700,37 @@ def analyze(before, after, top=10):
             warnings.append(f"current {name}: showing {top} of {len(data)} rows; inspect original snapshot")
         current[name] = [{key: row[key] for key in fields if key in row} for row in data[:top]]
         section = after.get("sections", {}).get(name, {})
-        if section.get("status") != "ok" or section.get("truncated"):
+        # Sections added after the first snapshot format are absent from older snapshots.
+        added_later = name in ("recovery_state", "vacuum_progress", "create_index_progress") and not section
+        if (section.get("status") != "ok" or section.get("truncated")) and not added_later:
             warnings.append(f"current {name}: missing or truncated evidence")
     current["lock_chains"] = lock_chains(after)[:top]
     current["xmin_horizon_holders"] = xmin_horizon_holders(after)[:top]
-    current["redundant_indexes"] = redundant_indexes(rows(after, "indexes"))[:top]
-    maintenance = autovacuum_backlog(rows(after, "tables"), settings(after), include_unknown=True)
+    index_rows, table_rows = rows(after, "indexes"), rows(after, "tables")
+    current["redundant_indexes"] = redundant_indexes(index_rows)[:top]
+    database_row = (rows(after, "database") or [{}])[0]
+    unused = unused_indexes(index_rows, table_rows, database_row.get("stats_reset"))
+    current["unused_indexes"] = unused[:top]
+    current["unused_indexes_total"] = {"indexes": len(unused), "bytes": sum(
+        x["index_bytes"] for x in unused if numeric(x["index_bytes"]))}
+    current["invalid_indexes"] = invalid_indexes(index_rows, rows(after, "create_index_progress"))[:top]
+    current["unindexed_foreign_keys"] = unindexed_foreign_keys(
+        rows(after, "foreign_keys"), deltas["tables"], after["metadata"].get("block_size"))[:top]
+    current["freeze_age"] = freeze_age(rows(after, "database_ages"), table_rows, settings(after), top)
+    for name in ("foreign_keys", "database_ages"):
+        section = after.get("sections", {}).get(name)
+        if section is not None and (section.get("status") != "ok" or section.get("truncated")):
+            warnings.append(f"current {name}: missing or truncated evidence")
+    skipped = sum(bool(row.get("size_skipped_locked")) for row in table_rows + index_rows)
+    if skipped:
+        warnings.append(f"sizes of {skipped} relation(s) were not read: an ACCESS EXCLUSIVE lock was held or queued "
+                        "on them during collection (see current.lock_chains)")
+    worst = max([x["xid_age_ratio"] or 0 for x in current["freeze_age"]["databases"]]
+                + [x["worst_ratio"] or 0 for x in current["freeze_age"]["tables_near_limit"]], default=0)
+    if worst >= 1:
+        warnings.append("freeze age: a database or table is past autovacuum_freeze_max_age; anti-wraparound "
+                        "vacuum is due or running (see current.freeze_age)")
+    maintenance = autovacuum_backlog(table_rows, settings(after), include_unknown=True)
     current["autovacuum_backlog"] = [x for x in maintenance if x["reason"] != "insufficient_trigger_evidence"][:top]
     current["autovacuum_unassessed"] = [x for x in maintenance if x.get("unknown_triggers")][:top]
     if current["autovacuum_unassessed"]:
@@ -548,6 +743,7 @@ def analyze(before, after, top=10):
         for name in ("subscriptions", "subscription_relations", "slots")
     }
     return {"schema_version": 1, "metadata": metadata, "instance_id": after["instance_id"], "database": after["metadata"]["database"],
+            "top": top,
             "window": {"from": before["started_at"], "to": after["finished_at"],
                        "note": "Overall collection bounds; use each section's elapsed_seconds for interval rates."},
             "rankings": rankings, "deltas": deltas, "current": current,
@@ -558,7 +754,14 @@ def analyze(before, after, top=10):
 
 
 def render_markdown(report):
+    """A digest sized for reading: rankings, non-zero system counters and compact current evidence.
+
+    The JSON report is the complete machine input for compare_intervals.py and review_config.py.
+    """
+    metadata = report.get("metadata") or {}
     lines = ["# PostgreSQL interval evidence", "", f"Instance: {report['instance_id']}; database: {report['database']}",
+             "Server: " + compact({k: metadata.get(k) for k in ("server_version_num", "in_recovery", "effective_role",
+                                                                "postmaster_start")}),
              f"Collection bounds: {report['window']['from']} → {report['window']['to']}",
              report['window']['note'], "",
              "Rankings identify candidates. An empty list is not a clean bill of health.", "", "## Data quality", ""]
@@ -597,12 +800,127 @@ def render_markdown(report):
             lines.append("| " + " | ".join(cell(value) for value in values) + " |")
         if not entries:
             lines += ["", "No comparable positive samples."]
-    lines += ["", "## System deltas and current evidence", "", "```json", json.dumps({
-        "deltas": {k: v for k, v in report["deltas"].items() if k not in ("pgss", "tables", "table_io", "indexes", "index_io")},
-        "current": report["current"]}, ensure_ascii=False, indent=2), "```", "", "## Interpretation limits", ""]
+    lines += system_markdown(report, cell) + current_markdown(report)
+    lines += ["", "## Interpretation limits", ""]
     lines += ["- " + value for value in report["limitations"]]
     lines += ["", "## Next steps", ""] + ["- " + value for value in report["next_steps"]]
     return "\n".join(lines) + "\n"
+
+
+SYSTEM_SECTIONS = ("database", "wal", "checkpointer", "bgwriter", "archiver", "conflicts", "subscription_stats",
+                   "replication_slots", "lock_stats", "recovery_prefetch")
+CURRENT_SECTIONS = (
+    ("lock_chains", "Lock chains, root blockers first"),
+    ("locks", "Waiting or blocking lock requests"),
+    ("activity", "Sessions, oldest transaction first"),
+    ("xmin_horizon_holders", "What holds back VACUUM, oldest first"),
+    ("prepared", "Prepared transactions"),
+    ("tables", "Tables by estimated dead rows"),
+    ("autovacuum_backlog", "Autovacuum backlog (past a trigger threshold)"),
+    ("autovacuum_unassessed", "Autovacuum triggers that could not be assessed"),
+    ("vacuum_progress", "VACUUM running now"),
+    ("create_index_progress", "Index builds running now"),
+    ("invalid_indexes", "Invalid indexes (maintained on write, never used)"),
+    ("redundant_indexes", "Redundant index candidates"),
+    ("unused_indexes", "Never-scanned index candidates"),
+    ("unindexed_foreign_keys", "Foreign keys without a supporting index"),
+    ("replication", "Replication senders"),
+    ("recovery_state", "Standby replay state"),
+    ("slots", "Replication slots"),
+    ("subscriptions", "Subscriptions"),
+    ("subscription_relations", "Subscription relations"),
+)
+
+
+def compact(value):
+    """One-line JSON without null or empty fields; floats keep four significant digits."""
+    def prune(item):
+        if isinstance(item, dict):
+            return {k: prune(v) for k, v in item.items() if v is not None and v != [] and v != {}}
+        if isinstance(item, list):
+            return [prune(v) for v in item]
+        if isinstance(item, float):
+            return float(f"{item:.4g}")
+        return item
+    return json.dumps(prune(value), ensure_ascii=False, separators=(", ", ": "))
+
+
+def system_markdown(report, cell):
+    """Interval counters as short lines; the JSON report keeps every field and zero value."""
+    lines = ["", "## System deltas (non-zero counters; rates and all fields are in the JSON report)", ""]
+    shown, unchanged = 0, {}
+    for name in SYSTEM_SECTIONS:
+        for entry in report["deltas"].get(name, []):
+            counters = {k: v for k, v in entry["delta"].items() if v}
+            if not counters:
+                unchanged[name] = unchanged.get(name, 0) + 1
+                continue
+            derived = {k: v for k, v in entry.items() if k not in ("identity", "delta", "per_second", "elapsed_seconds")}
+            identity = " " + compact(entry["identity"]) if entry["identity"] else ""
+            lines.append(f"- {name}{identity} over {entry['elapsed_seconds']:.1f}s: " + compact({**counters, **derived}))
+            shown += 1
+    if unchanged:
+        lines.append("- compared with every counter unchanged: "
+                     + ", ".join(name if count == 1 else f"{name} ({count} rows)" for name, count in unchanged.items()))
+    if not shown and not unchanged:
+        lines.append("No comparable system counters; see Data quality.")
+    # pg_stat_io has a row for every backend type/object/context; most are idle.
+    busy = [x for x in report["deltas"].get("io", [])
+            if any(x["delta"].get(k) for k in ("reads", "writes", "extends", "fsyncs", "writebacks"))]
+    busy.sort(key=lambda x: sum(x["delta"].get(k) or 0 for k in ("read_bytes", "write_bytes", "extend_bytes")), reverse=True)
+    limit = report.get("top") or 10
+    megabytes = lambda value: value / 1048576 if numeric(value) else None
+    lines += ["", f"## pg_stat_io (busiest {min(limit, len(busy))} of {len(busy)} rows with I/O; cluster-wide)", "",
+              "| Backend | Object | Context | Reads | Read MB | Read ms | Writes | Write MB | Write ms | Extends | Fsyncs | Evictions |",
+              "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for entry in busy[:limit]:
+        delta, identity = entry["delta"], entry["identity"]
+        values = [identity.get("backend_type"), identity.get("object"), identity.get("context"), delta.get("reads"),
+                  megabytes(delta.get("read_bytes")), delta.get("read_time"), delta.get("writes"),
+                  megabytes(delta.get("write_bytes")), delta.get("write_time"), delta.get("extends"),
+                  delta.get("fsyncs"), delta.get("evictions")]
+        lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+    if not busy:
+        lines += ["", "No I/O was counted, or pg_stat_io was not comparable."]
+    return lines
+
+
+def current_markdown(report):
+    """Point-in-time evidence from the later snapshot, one compact line per row."""
+    current = report["current"]
+    lines = ["", "## Current evidence (later snapshot; one moment, not the interval)"]
+    empty = []
+    for name, title in CURRENT_SECTIONS:
+        items = current.get(name) or []
+        if name == "activity":
+            # Idle background processes carry no transaction; the JSON report keeps them.
+            items = [x for x in items if x.get("xact_start") or x.get("wait_event_type") == "Lock"]
+        if name == "recovery_state":
+            items = [x for x in items if x.get("in_recovery")]
+        if not items:
+            empty.append(name)
+            continue
+        suffix = ""
+        if name == "unused_indexes" and current.get("unused_indexes_total"):
+            suffix = " — all candidates: " + compact(current["unused_indexes_total"])
+        lines += ["", f"### {title}{suffix}", ""] + ["- " + compact(item) for item in items]
+    freeze = current.get("freeze_age") or {}
+    if freeze.get("databases") or freeze.get("closest_table"):
+        lines += ["", "### Freeze age (ratio 1.0 = forced anti-wraparound vacuum)", "",
+                  "- limits: " + compact({k: freeze.get(k) for k in ("autovacuum_freeze_max_age",
+                                                                   "autovacuum_multixact_freeze_max_age",
+                                                                   "vacuum_failsafe_age")})]
+        databases = freeze.get("databases", [])
+        # The oldest database decides; the others matter only once they are close as well.
+        lines += ["- database: " + compact(item) for index, item in enumerate(databases[:3])
+                  if index == 0 or (item.get("xid_age_ratio") or 0) >= 0.5 or (item.get("mxid_age_ratio") or 0) >= 0.5]
+        lines += ["- table near limit: " + compact(item) for item in freeze.get("tables_near_limit", [])]
+        if not freeze.get("tables_near_limit") and freeze.get("closest_table"):
+            lines.append("- no table is past half of its limit; closest: " + compact(freeze["closest_table"]))
+    if empty:
+        lines += ["", "No rows for: " + ", ".join(empty) + ". An empty list is one moment's observation, "
+                  "and only as complete as the Data quality section says."]
+    return lines
 
 
 def main(argv=None):

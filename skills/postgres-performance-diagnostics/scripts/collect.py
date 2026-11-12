@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 SCHEMA_VERSION = 1
+MARKER = "/* postgres-performance-diagnostics */"
 SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
 SETTINGS = (
     "track_counts", "track_activities", "track_io_timing", "track_wal_io_timing",
@@ -41,7 +42,66 @@ SETTINGS = (
     "pg_stat_statements.track", "pg_stat_statements.track_planning", "pg_stat_statements.max",
     "pg_stat_statements.save", "pg_stat_statements.track_utility","auto_explain.log_min_duration", "auto_explain.sample_rate",
     "auto_explain.log_analyze", "auto_explain.log_timing", "auto_explain.log_buffers",
+    # PostgreSQL 19 replaces io_workers with a worker pool and logs autoanalyze separately.
+    "io_min_workers", "io_max_workers", "log_autoanalyze_min_duration", "autovacuum_max_parallel_workers",
+    "timing_clock_source", "effective_wal_level",
+    "track_cost_delay_timing", "vacuum_failsafe_age", "huge_pages_status", "temp_buffers",
+    "logical_decoding_work_mem", "data_checksums", "bgwriter_lru_maxpages",
+    "max_wal_senders", "max_replication_slots", "wal_keep_size", "archive_mode", "archive_timeout",
+    "idle_replication_slot_timeout", "recovery_min_apply_delay", "max_standby_archive_delay",
+    "idle_session_timeout", "log_lock_failures", "log_statement", "log_duration",
+    "default_transaction_isolation", "jit_inline_above_cost", "jit_optimize_above_cost",
 )
+# Coarse, fixed reasons for failures that carry no SQLSTATE. The matched text is never stored:
+# libpq and docker messages can include host names, user names and socket paths.
+FAILURES = (
+    (r"no such container", "docker_container_not_found"),
+    (r"container \S+ is not running|is not running", "docker_container_not_running"),
+    (r"cannot connect to the docker daemon|docker daemon is not running|permission denied while trying to connect to the docker",
+     "docker_unavailable"),
+    (r"executable file not found|no such file or directory: unknown", "psql_not_found_in_container"),
+    (r"database \".*\" does not exist", "database_not_found"),
+    (r"role \".*\" does not exist", "role_not_found"),
+    (r"password authentication failed|authentication failed", "authentication_failed"),
+    (r"no password supplied", "password_required"),
+    (r"no pg_hba\.conf entry", "rejected_by_pg_hba"),
+    (r"too many clients|remaining connection slots are reserved", "too_many_connections"),
+    (r"the database system is (starting up|shutting down|in recovery mode|not yet accepting connections)",
+     "server_not_accepting_connections"),
+    (r"definition of service \".*\" not found|service file \".*\" not found", "service_not_found"),
+    (r"could not translate host name|name or service not known|nodename nor servname|temporary failure in name resolution",
+     "unknown_host"),
+    (r"connection refused", "connection_refused"),
+    (r"timeout expired|timed out", "connection_timeout"),
+    (r"failed: no such file or directory|is the server running locally", "socket_not_found"),
+    (r"ssl error|ssl connection|sslmode|does not support ssl|certificate|gssapi", "tls_or_gss_negotiation_failed"),
+)
+HINTS = {
+    "password_required": "No password was available non-interactively; use a libpq password file or service, never a command-line password.",
+    "authentication_failed": "The server rejected the credentials; check the role, password file entry and pg_hba method.",
+    "rejected_by_pg_hba": "pg_hba.conf has no rule for this client address, database, role and TLS mode.",
+    "database_not_found": "Check PGDATABASE or the service definition; collect once per database.",
+    "role_not_found": "Check PGUSER or the service definition.",
+    "connection_refused": "Nothing listens on that host and port; check PGHOST, PGPORT and the server state.",
+    "connection_timeout": "No answer within PGCONNECT_TIMEOUT; check the network path and firewall.",
+    "unknown_host": "The host name does not resolve; check PGHOST or the service definition.",
+    "socket_not_found": "No server socket at the default location; set PGHOST or PGSERVICE.",
+    "service_not_found": "PGSERVICE names a service that pg_service.conf does not define.",
+    "too_many_connections": "No connection slot is free; this is itself evidence of connection exhaustion.",
+    "server_not_accepting_connections": "The server is starting, stopping or recovering; retry and record the event time.",
+    "tls_or_gss_negotiation_failed": "Encryption negotiation failed; check sslmode, certificates and the server's ssl setting.",
+    "docker_container_not_found": "No container has that name; check --docker-container.",
+    "docker_container_not_running": "The container exists but is stopped.",
+    "docker_unavailable": "The Docker daemon is not reachable from this user.",
+    "psql_not_found_in_container": "The container image has no psql on its PATH.",
+    "client_timeout": "psql did not finish in time; raise --statement-timeout-ms or check the connection.",
+    "sqlstate_42501": "Insufficient privilege; a monitoring role with pg_monitor or pg_read_all_stats sees these statistics.",
+    "sqlstate_55P03": "lock_timeout expired behind a conflicting lock; the section was retried once.",
+    "sqlstate_57014": "statement_timeout expired; raise --statement-timeout-ms or lower --row-limit.",
+    "sqlstate_55000": "The object is not usable in this state, e.g. pg_stat_statements is installed but not in shared_preload_libraries.",
+    "sqlstate_53200": "The server is out of memory or shared memory.",
+    "sqlstate_25006": "The transaction is read-only, as intended; a collector statement tried to write.",
+}
 
 
 def positive(value: str) -> int:
@@ -55,6 +115,32 @@ def quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def mark(sql: str) -> str:
+    """Tag a collector statement so pgss.sql can leave it out of the SQL rankings.
+
+    pg_stat_statements (verified on 18.6 and 19rc1) stores a statement from its first token, so
+    a comment in front of it is lost; one after the first keyword is kept. Only the collector's
+    SELECTs are tagged: BEGIN/SET/COMMIT share their query ID with the application's, and a tag
+    stored first by the collector would hide the application's calls as well.
+    """
+    match = re.match(r"\s*(\w+)\s+(.*)", sql, re.DOTALL)
+    if not match:
+        raise ValueError("collector SQL must start with a keyword")
+    return f"{match.group(1)} {MARKER} {match.group(2)}"
+
+
+def failure_reason(stderr: str) -> str:
+    """Reduce psql/docker stderr to a SQLSTATE or a fixed category; never return its text."""
+    states = re.findall(r"(?:ERROR|FATAL):\s+([0-9A-Z]{5})(?:\s|$)", stderr or "")
+    if states:
+        return "sqlstate_" + states[-1]
+    text = (stderr or "").lower()
+    for pattern, reason in FAILURES:
+        if re.search(pattern, text):
+            return reason
+    return "psql_failed"
+
+
 class CollectionError(Exception):
     pass
 
@@ -66,6 +152,8 @@ class Psql:
         self.env["PGAPPNAME"] = "postgres-performance-diagnostics"
         self.env["PGCLIENTENCODING"] = "UTF8"
         self.env.setdefault("PGCONNECT_TIMEOUT", "10")
+        # Connection failures are classified from untranslated client messages.
+        self.env["LC_MESSAGES"] = "C"
 
     def run(self, sql: str):
         # SQL, never passwords/connection strings, is sent on stdin. -X ignores .psqlrc.
@@ -80,7 +168,7 @@ class Psql:
             f"SET LOCAL statement_timeout = '{self.args.statement_timeout_ms}ms';\n"
             f"SET LOCAL lock_timeout = '{self.args.lock_timeout_ms}ms';\n"
             "SET LOCAL timezone = 'UTC';\nSET LOCAL stats_fetch_consistency = 'none';\n"
-            + "/* postgres-performance-diagnostics */ " + sql.rstrip().rstrip(";") + ";\nCOMMIT;\n"
+            + mark(sql.rstrip().rstrip(";")) + ";\nCOMMIT;\n"
         )
         try:
             result = subprocess.run(command, input=wrapped, text=True, encoding="utf-8",
@@ -92,9 +180,9 @@ class Psql:
         except subprocess.TimeoutExpired as exc:
             raise CollectionError("client_timeout") from exc
         if result.returncode:
-            # Server errors can contain SQL literals or connection details: store only SQLSTATE.
-            states = re.findall(r"(?:ERROR|FATAL):\s+([0-9A-Z]{5})(?:\s|$)", result.stderr)
-            raise CollectionError("sqlstate_" + states[-1] if states else "psql_failed")
+            # Server errors can contain SQL literals or connection details: store only a
+            # SQLSTATE or a fixed failure category.
+            raise CollectionError(failure_reason(result.stderr))
         try:
             return json.loads(result.stdout)
         except (ValueError, TypeError) as exc:
@@ -151,10 +239,13 @@ def collect(args: argparse.Namespace) -> dict:
     sections = {}
     names = ",".join("'" + name + "'" for name in SETTINGS)
     # Psql.run SET LOCALs these; report the session default instead of the collector's own value.
+    # source tells a role/database override (ALTER ROLE ... SET) of this collecting role from the
+    # cluster-wide value; the collector's own SET LOCAL sources are not reported as such.
     sections["settings"] = client.section(
         "SELECT name, CASE WHEN name IN ('statement_timeout', 'lock_timeout', 'stats_fetch_consistency', "
         "'search_path', 'timezone') THEN reset_val ELSE setting END AS setting, "
-        "unit, context, pending_restart FROM pg_settings "
+        "unit, context, CASE WHEN name IN ('statement_timeout', 'lock_timeout', 'stats_fetch_consistency', "
+        "'search_path', 'timezone') THEN NULL ELSE source END AS source, pending_restart FROM pg_settings "
         f"WHERE name IN ({names}) ORDER BY name"
     )
     manifest = json.loads((SQL_DIR / "queries.json").read_text(encoding="utf-8"))
@@ -173,11 +264,25 @@ def collect(args: argparse.Namespace) -> dict:
         sql = (SQL_DIR / item["file"]).read_text(encoding="utf-8")
         if "__PGSS_SCHEMA__" in sql:
             sql = sql.replace("__PGSS_SCHEMA__", quote_identifier(extension["schema"]))
+        # Definitions are computed only on request: pg_get_indexdef() also takes a table lock.
+        sql = sql.replace("__INCLUDE_TEXT__", "true" if args.include_query_text else "false")
         sensitive = ("conninfo",) if args.include_query_text else ("query", "indexdef", "conninfo")
-        try:
-            sections[item["name"]] = client.section(sql, sensitive)
-        except CollectionError as exc:
-            sections[item["name"]] = {"status": "error", "reason": str(exc), "rows": []}
+        for attempt in (1, 2):
+            try:
+                sections[item["name"]] = client.section(sql, sensitive)
+                if attempt == 2:
+                    sections[item["name"]]["retried_after"] = "sqlstate_55P03"
+                break
+            except CollectionError as exc:
+                reason = str(exc)
+                # A lock taken between the "busy relation" check and the size call: the second
+                # attempt sees it and skips that relation.
+                if reason == "sqlstate_55P03" and attempt == 1:
+                    continue
+                sections[item["name"]] = {"status": "error", "reason": reason, "rows": []}
+                if reason in HINTS:
+                    sections[item["name"]]["hint"] = HINTS[reason]
+                break
     end_meta = preflight(client)
     warnings = []
     if any(meta[k] != end_meta[k] for k in ("postmaster_start", "in_recovery", "database_oid")):
@@ -218,10 +323,12 @@ def main(argv=None) -> int:
             stream.write("\n")
     except (CollectionError, OSError, ValueError, KeyError) as exc:
         # File errors might include a path, but never echo connection strings or server error text.
-        print(f"error: {exc}", file=sys.stderr)
+        hint = HINTS.get(str(exc)) if isinstance(exc, CollectionError) else None
+        print(f"error: {exc}" + (f" ({hint})" if hint else ""), file=sys.stderr)
         return 2
-    failed = [name for name, value in snapshot["sections"].items() if value["status"] == "error"]
-    print(f"Saved snapshot: {args.output}; section errors: {len(failed)}", file=sys.stderr)
+    failed = {name: value.get("reason") for name, value in snapshot["sections"].items() if value["status"] == "error"}
+    detail = " (" + ", ".join(f"{name}={reason}" for name, reason in failed.items()) + ")" if failed else ""
+    print(f"Saved snapshot: {args.output}; section errors: {len(failed)}{detail}", file=sys.stderr)
     return 0
 
 

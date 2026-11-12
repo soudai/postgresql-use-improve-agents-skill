@@ -10,11 +10,17 @@ python scripts/collect.py --instance-id prod-primary --output after.json
 python scripts/analyze.py before.json after.json --format markdown --output interval.md --top 20
 ```
 
-上記はスキルフォルダからの実行例。間隔は処理の周期と目的から決める。正常時と繁忙時、日次／月次処理を区別し、秒単位の短い窓で長期傾向を断定しない。障害中のactivity／locksは時間間隔を明示した複数snapshotで捕捉する。
+上記はスキルフォルダからの実行例。Markdownは読むための要約で、順位表、0でない区間カウンタ、忙しい`pg_stat_io`行、1行ずつの現在の証拠を載せる。全フィールドと0の値は`--format json`のレポートにあり、`compare_intervals.py`や`postgres-config-tuning`にはJSONを渡す。間隔は処理の周期と目的から決める。正常時と繁忙時、日次／月次処理を区別し、秒単位の短い窓で長期傾向を断定しない。障害中のactivity／locksは時間間隔を明示した複数snapshotで捕捉する。
 
 クエリ時間の上限には`--statement-timeout-ms`（既定10000ms）と`--lock-timeout-ms`（既定1000ms）、件数には`--row-limit`（既定10000件）を使う。上限到達は「全体を取得済み」ではない。収集自体の負荷と所要時間を確認し、対象・間隔を調整する。各ビューは異なる時点で読まれるため、ファイル全体を原子的なDB状態と解釈しない。出力先は新しいファイルを指定する。既存スナップショットは上書きしない。
 
-収集自体もSQLを実行するため統計に影響する。識別できる収集SQLを除外しても、`BEGIN`・`SET`・`COMMIT`等のutility statementが`pg_stat_statements`に残る場合がある。高calls候補をアプリの処理と対応させるときは、収集間隔・時刻・tracking設定を確認する。これを消すために統計をresetしない。
+収集自体もSQLを実行するため統計に影響する。収集とサンプラーのSELECTは、先頭キーワードの直後に`/* postgres-performance-diagnostics */`を入れて識別し、`pgss.sql`が本文中のこの印で除外する（`pg_stat_statements`は文の前のコメントを保存しないことを18.6／19rc1で確認）。`BEGIN`・`SET`・`COMMIT`等のutility statementはアプリと同じquery IDを共有するため印を付けず、`pg_stat_statements`に残る場合がある。高calls候補をアプリの処理と対応させるときは、収集間隔・時刻・tracking設定を確認する。これを消すために統計をresetしない。
+
+サイズ関数（`pg_relation_size`等）と`pg_get_indexdef()`は対象にロックを取るため、`ACCESS EXCLUSIVE`ロックが保持・待機中のrelationは読まずに`size_skipped_locked=true`とする。サイズはnullで、0ではない。`analyze.py`はその件数を警告に出す。確認と取得の間にロックが入り`lock_timeout`（SQLSTATE `55P03`）になった節は1回だけ再試行し、`retried_after`に残す。索引定義（`indexdef`）は`--include-query-text`のときだけサーバで計算する。`sql/indexes.sql`をpsqlで直接使う場合は`__INCLUDE_TEXT__`を`true`か`false`に置き換える。
+
+設定は`source`を併せて残す（収集側が`SET LOCAL`する項目を除く）。`role`や`database`は、収集ロール・DBへの`ALTER ROLE／DATABASE ... SET`による値で、アプリのロールに同じ値が効いているとは限らない。
+
+接続や節の失敗は、SQLSTATEか固定の分類（`authentication_failed`、`rejected_by_pg_hba`、`too_many_connections`、`docker_container_not_found`等）だけを`reason`に残し、psql／dockerのメッセージ本文は保存しない。既知の分類には`hint`を付け、標準エラーに失敗した節名と分類を出す。`too_many_connections`はそれ自体が接続枯渇の証拠になる。
 
 累積統計は「どのSQLが時間を使ったか」を示すが、その時間の待機内訳は示さない。症状が出ている間は`scripts/sample_activity.py`で待機をサンプリングし、snapshotの区間と時刻を揃えて照合する。接続・権限・`--docker-container`の扱いは`collect.py`と同じ。手順と解釈は[wait-events.md](wait-events.md)を参照。
 
@@ -87,6 +93,18 @@ SET auto_explain.sample_rate = 0.1;
 値は採取方法の例で、推奨の固定閾値ではない。権限・対象・期間・保存先・ログ量を確認して使用する。`log_analyze`は計測負荷があり、`log_timing=off`でも計測が無料になるわけではない。終了時に設定を戻す。パラメータ記録を止めてもSQLリテラルや計画に秘密情報が残る場合がある。
 
 `scripts/analyze_logs.py LOG --format markdown --output REPORT`はPostgreSQLのJSONログをオフライン解析する。`--max-events`（既定1000件）は出力するイベント数の上限、`--include-details`はメッセージ・statement・detailの出力を許可する指定。stderrやCSV形式は形式を確認してから別途構造化する。ログ出力がないことを事象がなかった証拠にしない。採取閾値やサンプリングが不明なログから、全体のpercentileを推定しない。
+
+同じレポートに次の集計が入る。
+
+| 項目 | 内容 |
+| --- | --- |
+| checkpoints／restartpoints | 原因（time／wal／immediate等）別の開始回数、書込buffer数、write／sync時間の合計、total・longest syncの最大、WALファイルの追加・削除・再利用。18と19のログ形式に対応 |
+| autovacuum | テーブル別のvacuum／analyze回数、aggressive・wraparound防止の回数、所要時間、削除行数、`dead but not yet removable`の最大と発生回数、cutoffの古さ、index scans |
+| lock_wait（events） | 待機したlock mode、対象、保持PID（`holder_pids`）と待機列。過去のPIDなので現在のセッションと同一視しない |
+| error_states | SQLSTATE別の件数。statement_timeout（`57014`）、lock_timeout（`55P03`）、deadlock（`40P01`）等を区別する |
+| auto_explain_plans | ログ中のJSON／text計画の件数 |
+
+`--extract-plans DIR`は所要時間の長いauto_explainのJSON計画を最大`--max-plans`件（既定20）、新しいファイルとして書き出す。各ファイルは`analyze_plan.py`へそのまま渡せ、採取元の行・duration・query IDを持つ。計画にはSQL本文とリテラルが含まれるため、保存先と共有範囲を決めてから使う。
 
 メッセージ文字列によるtemp・duration等の分類は英語ログを対象とする。deadlockはSQLSTATE `40P01`でも検出する。ローカライズされたメッセージや未知の形式を未分類のまま残した場合、その制限を報告する。parse／bind／execute等のdurationを同一実行の独立サンプルとして足し合わせない。
 

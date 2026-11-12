@@ -39,7 +39,7 @@ work_memの総予算を考える粗い試算（安全な上限の保証ではな
 | min_wal_size | 既定80MB | WALファイルの再利用量。WAL量が周期的に急増する環境で上げる |
 | checkpoint_timeout | 既定5min。書き込みの多い環境では15min程度 | checkpoint後の最初の更新でfull-page imageが書かれる。間隔を延ばすとFPIとI/Oが減り、復旧時間が延びる |
 | checkpoint_completion_target | 0.9（14以降の既定） | 書き込みをcheckpoint間隔に分散する |
-| wal_compression | `lz4`または`zstd` | FPIを圧縮し、WAL・アーカイブ・レプリケーション量を減らす。CPUを使う。ビルドの対応を確認 |
+| wal_compression | `lz4`または`zstd` | FPIを圧縮し、WAL・アーカイブ・レプリケーション量を減らす。CPUを使う。ビルドの対応を確認。区間レポートがあれば、19ではWAL bytesに占めるFPIの割合（`fpi_bytes_share`、0.4超）、18ではレコード比（0.2超）で判断する |
 | wal_buffers | 既定-1（shared_buffersの1/32、最大16MB） | `pg_stat_wal.wal_buffers_full`が増え続ける場合に64MB程度へ。再起動が必要 |
 | synchronous_commit | `on` | `off`は直近のcommitを失い得る（破損はしない）。許容できる処理だけトランザクション・ロール単位で使う |
 | fsync, full_page_writes | `on` | 性能目的で`off`にしない。データ破損の危険がある |
@@ -98,6 +98,7 @@ autovacuumが追い付かない原因が、古いsnapshot・replication slot・p
 | log_lock_waits | `on` | `deadlock_timeout`を超えたロック待ち |
 | log_temp_files | `0`または数MB以上 | spillしたSQLの特定 |
 | log_autovacuum_min_duration | 数秒〜（15以降の既定10min） | 遅いautovacuumと原因 |
+| log_autoanalyze_min_duration | 数秒〜（PostgreSQL 19） | 19ではautoanalyzeを別の閾値で記録する。18にはない |
 | track_activity_query_size | 4kB以上 | activityでのSQLの切り詰め防止。再起動が必要 |
 
 ## タイムアウトと安全網

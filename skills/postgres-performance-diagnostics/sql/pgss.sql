@@ -2,10 +2,12 @@
 -- For direct psql use, replace that identifier with the installed schema first.
 -- Cumulative counters only; derive interval rankings from two valid snapshots.
 -- query may contain literals: collect.py removes it unless explicitly requested.
--- This exact reserved prefix identifies this toolkit's collection SELECTs only.
+-- The reserved comment identifies this toolkit's own SELECTs (collector and sampler). It is
+-- matched anywhere in the text because pg_stat_statements drops a comment that precedes the
+-- statement; the tools place it after the first keyword.
 SELECT s.*
 FROM __PGSS_SCHEMA__.pg_stat_statements AS s
 WHERE s.dbid = (SELECT oid FROM pg_catalog.pg_database
                 WHERE datname = pg_catalog.current_database())
-  AND (s.query IS NULL OR s.query NOT LIKE '/* postgres-performance-diagnostics */%')
+  AND (s.query IS NULL OR s.query NOT LIKE '%/* postgres-performance-diagnostics */%')
 ORDER BY s.dbid, s.userid, s.queryid, s.toplevel;

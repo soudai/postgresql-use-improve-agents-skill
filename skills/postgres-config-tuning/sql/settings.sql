@@ -10,7 +10,9 @@
 \endif
 BEGIN READ ONLY;
 -- Preserve the setting and its source together before applying collector guards.
-SELECT pg_catalog.jsonb_object_agg(name, pg_catalog.jsonb_build_object('setting', setting, 'source', source)) AS original_guards
+-- The comment after SELECT survives in pg_stat_statements (a leading one does not); the
+-- diagnostics collector uses it to keep these two statements out of its SQL rankings.
+SELECT /* postgres-performance-diagnostics */ pg_catalog.jsonb_object_agg(name, pg_catalog.jsonb_build_object('setting', setting, 'source', source)) AS original_guards
 FROM pg_catalog.pg_settings
 WHERE name IN ('statement_timeout', 'lock_timeout', 'timezone', 'search_path')
 \gset
@@ -19,7 +21,7 @@ SET LOCAL statement_timeout = '10s';
 SET LOCAL lock_timeout = '1s';
 SET LOCAL timezone = 'UTC';
 
-SELECT jsonb_build_object(
+SELECT /* postgres-performance-diagnostics */ jsonb_build_object(
   'kind', 'pg_settings_export',
   'collected_at', clock_timestamp(),
   'server_version_num', current_setting('server_version_num')::integer,

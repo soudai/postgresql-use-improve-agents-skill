@@ -24,9 +24,18 @@ WITH target AS MATERIALIZED (
     FROM target AS t
     CROSS JOIN LATERAL pg_catalog.pg_partition_tree(pg_catalog.pg_partition_root(t.oid)) AS tree
     LIMIT 501
+), busy AS MATERIALIZED (
+    -- pg_relation_size() queues behind a granted or waiting ACCESS EXCLUSIVE lock; skip those.
+    SELECT DISTINCT l.relation
+    FROM pg_catalog.pg_locks AS l
+    WHERE l.locktype = 'relation' AND l.mode = 'AccessExclusiveLock'
+      AND l.database = (SELECT oid FROM pg_catalog.pg_database
+                        WHERE datname = pg_catalog.current_database())
 ), partition_details AS (
     SELECT m.relid, m.parentrelid, m.isleaf, m.level, n.nspname AS schema_name, c.relname,
-           c.reltuples AS estimated_rows, pg_catalog.pg_relation_size(c.oid) AS heap_bytes,
+           c.reltuples AS estimated_rows,
+           CASE WHEN NOT EXISTS (SELECT 1 FROM busy AS b WHERE b.relation = c.oid)
+                THEN pg_catalog.pg_relation_size(c.oid) END AS heap_bytes,
            st.last_analyze, st.last_autoanalyze, st.n_mod_since_analyze,
            p.partstrat AS partition_strategy, p.partattrs::text AS partition_key_attributes,
            p.partexprs IS NOT NULL AS expression_key,
@@ -46,8 +55,9 @@ WITH target AS MATERIALIZED (
     SELECT a.attnum, a.attname,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
            a.attnotnull, a.attidentity, a.attgenerated,
+           -- NULL (PostgreSQL 17+) or -1 means "not set": the column uses default_statistics_target.
            a.attstattarget AS statistics_target,
-           CASE WHEN a.attstattarget < 0
+           CASE WHEN a.attstattarget IS NULL OR a.attstattarget < 0
                 THEN pg_catalog.current_setting('default_statistics_target')::integer
                 ELSE a.attstattarget END AS effective_statistics_target,
            pg_catalog.has_column_privilege(t.oid, a.attnum, 'SELECT') AS select_permitted,
@@ -119,7 +129,8 @@ WITH target AS MATERIALIZED (
     JOIN pg_catalog.pg_statistic_ext AS e ON e.stxrelid = t.oid
     JOIN pg_catalog.pg_namespace AS n ON n.oid = e.stxnamespace
 )
-SELECT jsonb_build_object(
+-- The comment keeps this statement out of collect.py's SQL rankings (see pgss.sql).
+SELECT /* postgres-performance-diagnostics */ jsonb_build_object(
     'schema_version', 1,
     'collected_at', clock_timestamp(),
     'server_version_num', current_setting('server_version_num')::integer,

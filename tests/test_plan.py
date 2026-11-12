@@ -121,6 +121,93 @@ class PlanTests(unittest.TestCase):
         kinds = {c["kind"] for c in MODULE.analyze(raw)["plans"][0]["candidates"]}
         self.assertEqual(kinds, {"lossy_bitmap", "planning_dominates", "jit_overhead"})
 
+    def test_semi_join_inner_side_is_not_a_statistics_failure(self):
+        # Shape observed on PostgreSQL 18.6: EXISTS becomes a semi nested loop that stops at the first match.
+        def plan(join_type):
+            return {"Plan": {"Node Type": "Nested Loop", "Join Type": join_type, "Plan Rows": 667, "Actual Rows": 2000,
+                             "Actual Loops": 1, "Plans": [
+                {"Node Type": "Function Scan", "Parent Relationship": "Outer", "Plan Rows": 2000, "Actual Rows": 2000,
+                 "Actual Loops": 1},
+                {"Node Type": "Index Only Scan", "Parent Relationship": "Inner", "Plan Rows": 66667, "Actual Rows": 1,
+                 "Actual Loops": 2000, "Index Searches": 2000}]}}
+        semi = MODULE.analyze(plan("Semi"))["plans"][0]
+        inner = semi["nodes"][2]
+        self.assertEqual(inner["cardinality"]["status"], "partial_early_exit")
+        self.assertEqual(inner["metrics"]["Index Searches"], 2000)
+        self.assertEqual(semi["candidates"], [])
+        # The same numbers under an ordinary join are a real 66667x overestimate.
+        inner_join = MODULE.analyze(plan("Inner"))["plans"][0]
+        self.assertEqual([c["path"] for c in inner_join["candidates"] if c["kind"] == "cardinality_mismatch"],
+                         ["Plan/Plans/1"])
+
+    def test_mismatch_is_weighed_over_all_loops_from_one_row_up(self):
+        def kinds(plan_rows, actual, loops):
+            raw = {"Plan": {"Node Type": "Index Scan", "Plan Rows": plan_rows, "Actual Rows": actual, "Actual Loops": loops}}
+            return [c["kind"] for c in MODULE.analyze(raw)["plans"][0]["candidates"]]
+        # 50 rows per loop against an estimate of 1 is small once, and 500000 unexpected rows over 10000 loops.
+        self.assertEqual(kinds(1, 50, 1), [])
+        self.assertEqual(kinds(1, 50, 10000), ["cardinality_mismatch"])
+        # An estimate of one row with "0" actual (a rounded average) is the planner's floor, not a miss.
+        self.assertEqual(kinds(1, 0, 10000), [])
+        self.assertEqual(kinds(1, 0.2, 10000), [])
+        self.assertEqual(kinds(50000, 0, 1), ["cardinality_mismatch"])
+
+    def test_tuplestore_spill_join_filter_and_capture_context(self):
+        raw = {"Plan": {"Node Type": "Nested Loop", "Join Type": "Inner", "Plan Rows": 10, "Actual Rows": 10,
+                        "Actual Loops": 1, "Actual Total Time": 80.0, "Rows Removed by Join Filter": 990000,
+                        "Join Filter": "(a.code = b.code)", "Plans": [
+                   {"Node Type": "Seq Scan", "Relation Name": "a", "Plan Rows": 1000, "Actual Rows": 1000,
+                    "Actual Loops": 1, "Actual Total Time": 1.0},
+                   {"Node Type": "Materialize", "Plan Rows": 1000, "Actual Rows": 1000, "Actual Loops": 1000,
+                    "Actual Total Time": 0.05, "Storage": "Disk", "Maximum Storage": 9343}]},
+               "Settings": {"work_mem": "64kB", "enable_hashjoin": "off"}, "Query Identifier": -6004425419096503781,
+               "Query Text": "SELECT 'TOP_SECRET_PARAMETER'"}
+        plan = MODULE.analyze({"plan": raw, "capture": {"source": "auto_explain jsonlog line 7",
+                                                         "logged_duration_ms": 100.0}})["plans"][0]
+        kinds = {c["kind"]: c for c in plan["candidates"]}
+        self.assertEqual(kinds["join_filter_discards"]["evidence"]["approximate_total_removed"], 990000)
+        self.assertEqual(kinds["tuplestore_disk"]["evidence"]["maximum_storage_kb"], 9343)
+        self.assertEqual(plan["settings"], {"work_mem": "64kB", "enable_hashjoin": "off"})
+        self.assertEqual(plan["query_id"], "-6004425419096503781")
+        # No Execution Time in auto_explain output: shares use the duration its log line reported.
+        self.assertEqual((plan["time_basis"], plan["logged_duration_ms"]), ("logged_duration", 100.0))
+        self.assertAlmostEqual(plan["hotspots"][0]["share_of_execution"], 0.5)
+        text = MODULE.markdown({"plans": [plan], "limitations": []})
+        self.assertIn("enable_hashjoin", text)
+        self.assertIn("of the logged duration", text)
+        self.assertNotIn("TOP_SECRET_PARAMETER", json.dumps(plan) + text)
+        bare = MODULE.analyze({"Plan": {"Node Type": "Seq Scan", "Actual Total Time": 4.0, "Actual Loops": 1}})["plans"][0]
+        self.assertEqual((bare["time_basis"], bare["hotspots"][0]["share_of_execution"]), ("root_node", 1))
+
+    def test_anti_join_small_output_is_not_missing_partners(self):
+        def join(join_type):
+            return {"Plan": {"Node Type": "Hash Join", "Join Type": join_type, "Plan Rows": 40, "Actual Rows": 40,
+                             "Actual Loops": 1, "Plans": [
+                {"Node Type": "Seq Scan", "Relation Name": "items", "Plan Rows": 800000, "Actual Rows": 800000, "Actual Loops": 1},
+                {"Node Type": "Hash", "Plan Rows": 800000, "Actual Rows": 800000, "Actual Loops": 1, "Plans": [
+                    {"Node Type": "Seq Scan", "Relation Name": "orders", "Plan Rows": 800000, "Actual Rows": 800000,
+                     "Actual Loops": 1}]}]}}
+        found = lambda t: [c["path"] for c in MODULE.analyze(join(t))["plans"][0]["candidates"]
+                           if c["kind"] == "join_discards_scanned_rows"]
+        self.assertEqual(found("Inner"), ["Plan/Plans/0", "Plan/Plans/1/Plans/0"])
+        self.assertEqual(found("Semi"), ["Plan/Plans/0"])  # Only outer rows are returned by a semi join.
+        self.assertEqual(found("Anti"), [])                # Few rows out means most rows DID match.
+
+    def test_markdown_lists_one_line_per_node_up_to_the_limit(self):
+        children = [{"Node Type": "Seq Scan", "Relation Name": f"part_{i}", "Plan Rows": 5, "Actual Rows": 5,
+                     "Actual Loops": 1, "Shared Hit Blocks": 3, "Startup Cost": 0.0, "Total Cost": 9.5}
+                    for i in range(120)]
+        report = MODULE.analyze({"Plan": {"Node Type": "Append", "Plan Rows": 600, "Actual Rows": 600,
+                                          "Actual Loops": 1, "Plans": children}})
+        text = MODULE.markdown(report, max_nodes=30)
+        node_lines = [line for line in text.splitlines() if line.startswith("- `Plan")]
+        self.assertEqual(len(node_lines), 30)
+        self.assertIn("91 more node(s) not shown", text)
+        self.assertIn("rows est 5 / act 5 x1", node_lines[1])
+        self.assertIn('"Shared Hit Blocks": 3', node_lines[1])
+        self.assertNotIn("Total Cost", text)  # Costs stay in the JSON report.
+        self.assertEqual(len(report["plans"][0]["nodes"]), 121)
+
     def test_invalid_structure_rejected(self):
         for data in ([], {}, {"Plan": []}, [{"wrong": True}], {"Plan": {"Node Type": "Scan", "Plans": {}}}):
             with self.assertRaises(ValueError):

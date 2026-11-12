@@ -140,6 +140,44 @@ class ConfigTests(unittest.TestCase):
         _, found = run(settings(), storage="hdd")
         self.assertNotIn("random_page_cost", found)
 
+    def test_full_page_image_byte_share_decides_over_record_share(self):
+        def report(records, fpi, byte_share=None, bound=None, timed=12):
+            data = interval(timed, 0)
+            data["deltas"]["wal"][0].update({"delta": {"wal_records": records, "wal_fpi": fpi},
+                                             "fpi_bytes_share": byte_share, "fpi_bytes_share_upper_bound": bound})
+            return data
+
+        # PostgreSQL 19: 5% of records but 70% of bytes are images.
+        _, found = run(settings(), report(1000, 50, byte_share=0.7, bound=0.9))
+        self.assertEqual(found["wal_compression"]["evidence"]["fpi_bytes_share"], 0.7)
+        self.assertEqual(found["wal_compression"]["evidence"]["fpi_bytes_share_upper_bound"], 0.9)
+        self.assertIn("checkpoint_timeout", found)
+        # A high record share does not override a measured low byte share.
+        _, found = run(settings(), report(1000, 400, byte_share=0.3))
+        self.assertNotIn("wal_compression", found)
+        self.assertNotIn("checkpoint_timeout", found)
+        # PostgreSQL 18: only the record share is known.
+        _, found = run(settings(), report(1000, 250))
+        self.assertIn("wal_compression", found)
+        self.assertNotIn("checkpoint_timeout", found)
+        self.assertIsNone(found["wal_compression"]["evidence"]["fpi_bytes_share"])
+        _, found = run(settings(), report(1000, 100))
+        self.assertNotIn("wal_compression", found)
+        # Without interval evidence the suggestion stays, as before.
+        _, found = run(settings())
+        self.assertIn("wal_compression", found)
+        _, found = run(settings(wal_compression="lz4"), report(1000, 50, byte_share=0.9))
+        self.assertNotIn("wal_compression", found)
+
+    def test_autoanalyze_logging_is_checked_only_where_it_exists(self):
+        _, found = run(settings())
+        self.assertNotIn("log_autoanalyze_min_duration", found)
+        data = settings()
+        data["settings"].append({"name": "log_autoanalyze_min_duration", "setting": "-1", "unit": "ms",
+                                 "context": "sighup", "source": "default", "pending_restart": False})
+        _, found = run(data)
+        self.assertEqual(found["log_autoanalyze_min_duration"]["recommended"], "10s")
+
     def test_role_scoped_safety_nets(self):
         _, found = run(settings(idle_in_transaction_session_timeout="0", statement_timeout="30000"))
         self.assertEqual(found["idle_in_transaction_session_timeout"]["scope"], "role")
