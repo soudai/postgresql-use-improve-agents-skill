@@ -6,6 +6,33 @@ PostgreSQLの性能診断、設定・テーブル設計・セキュリティの�
 
 まずは[日本語の利用例](example/ja/README.md)または[English examples](example/en/README.md)を参照してください。skill本体の指示と詳細な参照資料は主に日本語で、ユースケース別の例は日英両方を用意しています。
 
+## Claude Codeのプラグインとして導入する
+
+このリポジトリはClaude Codeのプラグインであり、そのマーケットプレイスでもあります。Claude Codeで次を実行します。
+
+```text
+/plugin marketplace add soudai/postgresql-use-improve-agents-skill
+/plugin install postgresql-skills@postgresql-use-improve-agents-skill
+```
+
+5つのskillがまとめて導入されます。やりたいことを伝えると、Claudeが説明文から適したskillを選びます。skill名をコマンドとして指定することもできます。
+
+```text
+/postgresql-skills:postgres-performance-diagnostics before.json と after.json を
+レビューしてください。対象APIのp95目標は200msです。利用者への影響順に候補を並べ、
+検証・切り戻しの手順も示してください。
+```
+
+| 操作 | コマンド |
+| --- | --- |
+| 最新版へ更新 | `/plugin marketplace update postgresql-use-improve-agents-skill` |
+| アンインストール | `/plugin uninstall postgresql-skills@postgresql-use-improve-agents-skill` |
+| 導入せずに手元のcheckoutを試す | `claude --plugin-dir /path/to/postgresql-use-improve-agents-skill` |
+
+動作要件: 付属スクリプトはClaude Codeを動かすマシンで実行され、Python 3.10以降が必要です。PostgreSQLへ接続する収集スクリプトには、`psql`または`--docker-container`で指定する既存のコンテナも必要です。接続情報はlibpqの環境変数かサービスファイルで渡し、パスワードをプロンプトに書かないでください。
+
+その他のエージェントでの使い方は[エージェントで使う](#エージェントで使う)を参照してください。
+
 ## 目的に合うskillを選ぶ
 
 | 目的 | Skill | 主な入力 |
@@ -32,20 +59,7 @@ JSONに`"decision": "rollback_candidate"`が出力されます。変更後の合
 
 ## エージェントで使う
 
-### Claude Codeのプラグイン
-
-このリポジトリはClaude Codeのプラグインマーケットプレイスでもあります。Claude Codeで次を実行します。
-
-```text
-/plugin marketplace add soudai/postgresql-use-improve-agents-skill
-/plugin install postgresql-skills@postgresql-use-improve-agents-skill
-```
-
-5つのskillがまとめて導入されます。Claudeは説明文から適したskillを選びます。`/postgresql-skills:postgres-performance-diagnostics`のように明示して呼び出すこともできます。更新は`/plugin marketplace update postgresql-use-improve-agents-skill`で行います。導入せずに手元のcheckoutを試す場合は、`claude --plugin-dir /path/to/postgresql-use-improve-agents-skill`でClaude Codeを起動します。
-
-付属スクリプトの実行には、Claude Codeを動かすマシンにPython 3.10以降が必要です。PostgreSQLへ接続する収集スクリプトには`psql`（または`--docker-container`）も必要です。
-
-### その他のエージェント
+Claude Codeでは[Claude Codeのプラグインとして導入する](#claude-codeのプラグインとして導入する)の手順で導入します。その他のエージェントでは次のようにします。
 
 `skills/`から必要なskillのフォルダ全体を、利用するエージェントのskill探索ディレクトリへ配置します。含まれる`SKILL.md`、`scripts/`、`sql/`、`references/`、`assets/`は一緒に配置してください。既存の同名skillがある場合は、差分を確認してから置き換えます。探索先と呼び出し構文はエージェントによって異なります。
 
