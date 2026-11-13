@@ -138,6 +138,16 @@ python skills/postgres-config-tuning/scripts/review_config.py snapshots/settings
 
 資格情報はコマンド、プロンプト、Git管理するファイルに記載しないでください。識別子、SQL、計画、ログにも機密情報が含まれ得るため、収集・共有は必要な範囲に限定します。`snapshots/`と`reports/`はGitの対象外ですが、ファイルのアクセス権限が制限されるわけではありません。
 
+## データの扱いとネットワーク通信
+
+すべての処理はClaude Codeを実行しているマシン上で動きます。このプラグインはskillだけで構成され、hook、MCPサーバ、常駐プロセス、テレメトリを含みません。
+
+- 収集スクリプト（`collect.py`、`sample_activity.py`、同梱の`sql/`）は、libpqの設定で指定したPostgreSQLサーバへ`psql`で接続するか、`--docker-container`で指定した既存コンテナ内の`psql`を実行するだけです。catalogと統計を読み取り、指定した出力先へJSONを書き込みます。
+- インターネットへ接続するのは`skills/postgres-security-review/scripts/advisories.py`だけです。実行時に公開ページ`https://www.postgresql.org/support/versioning/`と`https://www.postgresql.org/support/security/`の2つをHTTPSで取得し、利用者の環境に関する情報は送信しません。その他の解析スクリプトはローカルファイルだけを使ってオフラインで動作します。
+- snapshotとレポートはローカルディスクに残ります。プラグインがアップロードしたり、他のサービスへ送信したり、指示された出力ファイル以外にデータを保持したりすることはありません。
+- プラグインは資格情報を読み取り・保存・送信しません。パスワードはlibpqのパスワードファイルやサービスファイルに置いたままにします。
+- `tests/`の統合テストは開発用で、導入されるskillには含まれません。
+
 ## 対応版と検証
 
 性能診断・設定・テーブル設計はPostgreSQL 18・19を対象としています。記録済みの統合テストにはPostgreSQL 18.6と19 RC1が含まれます。これは検証したビルドの記録で、最新リリースの説明ではありません。利用するサーバ、拡張、managed serviceの実際の仕様で検証してください。セキュリティ収集は14以降で版に応じたcatalogを取得し、より古い版では識別・版情報の取得を試みます。すべての版の完全な対応を意味しません。
@@ -169,6 +179,7 @@ example/inputs/workload/ 実行可能な比較用の合成データ
 tests/                   ユニットテスト・隔離環境のDBシナリオ
 README.md                英語ガイド
 README_ja.md             日本語ガイド
+PUBLISHING.md            Claudeプラグインディレクトリへの公開手順（メンテナ向け）
 ```
 
 ## ライセンス

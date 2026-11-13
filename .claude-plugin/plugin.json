@@ -1,6 +1,7 @@
 {
   "name": "postgresql-skills",
-  "version": "0.1.0",
+  "displayName": "PostgreSQL Diagnostics and Review",
+  "version": "0.1.1",
   "description": "PostgreSQL 18/19 skills: performance diagnostics, configuration tuning, schema review, security review and workload validation, each with evidence collectors and offline analyzers.",
   "author": {
     "name": "soudai",

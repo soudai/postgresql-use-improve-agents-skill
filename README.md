@@ -138,6 +138,16 @@ The collectors primarily read catalogs and statistics. Plans using `EXPLAIN ANAL
 
 Avoid putting credentials in commands, prompts or tracked files. Identifiers, SQL, plans and logs can also contain sensitive information; limit collection and sharing to what the task requires. `snapshots/` and `reports/` are ignored by Git, but that does not restrict filesystem access.
 
+## Data handling and network access
+
+Everything runs locally, on the machine where Claude Code runs. The plugin contains only skills: no hooks, MCP servers, background processes or telemetry.
+
+- The collectors (`collect.py`, `sample_activity.py` and the bundled `sql/` files) connect only to the PostgreSQL server selected by your libpq settings, through `psql`, or run `psql` inside an existing container named with `--docker-container`. They read catalogs and statistics and write JSON to the output path you give.
+- `skills/postgres-security-review/scripts/advisories.py` is the only script that uses the internet. When run, it downloads two public pages over HTTPS, `https://www.postgresql.org/support/versioning/` and `https://www.postgresql.org/support/security/`, and sends no information about your environment. Every other analyzer works offline on local files.
+- Snapshots and reports stay on local disk. The plugin does not upload them, send them to any other service, or keep data beyond the files you ask it to write.
+- The plugin does not read, store or transmit credentials. Passwords stay in your libpq password or service file.
+- The integration tests under `tests/` are for development only and are not part of the installed skills.
+
 ## Compatibility and validation
 
 Performance diagnostics, configuration tuning and schema review target PostgreSQL 18 and 19. Recorded integration runs include PostgreSQL 18.6 and 19 RC1; this is a tested-build record, not a statement about the latest release. Validate the exact server, extensions and managed-service behavior you use. The security collector supports version-dependent catalog collection on PostgreSQL 14+ and attempts identity/version collection on older releases; this does not imply complete coverage of every version.
@@ -169,6 +179,7 @@ example/inputs/workload/ Runnable synthetic comparison inputs
 tests/                   Unit tests and isolated PostgreSQL scenarios
 README.md                English guide
 README_ja.md             Japanese guide
+PUBLISHING.md            Maintainer steps for the Claude plugin directory (Japanese)
 ```
 
 ## License
